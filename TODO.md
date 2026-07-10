@@ -32,3 +32,19 @@
 Estimated active implementation time: about 5-7 hours, plus 30-90 minutes for
 the model-backed remote smoke test when provider credentials and quota are
 available.
+
+## Resource Multiplexing And Local Mode
+
+- [ ] Make shared-host resource multiplexing an explicit Loom capability and
+  product distinction. Support multiple I/O-bound agent tasks on one long-lived
+  worker instead of assuming one isolated sandbox per trial.
+- [ ] Document the utilization and cost trade-off against per-task SaaS sandbox
+  models such as Harbor environment providers, without claiming an advantage
+  for CPU-bound or strict-isolation workloads.
+- [ ] Benchmark throughput, CPU and memory utilization, queueing delay, failure
+  interference, and cost per completed task at different concurrency levels.
+- [ ] Define optional isolation levels so operators can choose direct host
+  execution, separate processes, containers, or stronger external sandboxes.
+- [ ] Add a one-command local mode that starts an embedded Hub and localhost
+  Runner automatically while preserving the same scheduling, lease, retry, and
+  result-recovery semantics as multi-host mode.
