@@ -33,6 +33,7 @@ from loom_contract import (
     FIXED_CONCURRENCY_BACKOFF_ISSUES,
     HUB_API_VERSION,
     INVENTORY_SCHEMA_VERSION,
+    merge_extensions,
     metadata,
     RUNNER_API_VERSION,
 )
@@ -606,6 +607,25 @@ def json_object(value: Any) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def merged_dispatch_extensions(dispatch: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep user metadata opaque while making its merge order explicit."""
+    dispatch_payload = dispatch.get("payload") or {}
+    task_payload = task.get("payload") or {}
+    if not isinstance(dispatch_payload, dict):
+        raise ValueError("dispatch.payload must be an object")
+    if not isinstance(task_payload, dict):
+        raise ValueError("task.payload must be an object")
+    layers = (
+        ("dispatch.extensions", dispatch.get("extensions")),
+        ("dispatch.payload.extensions", dispatch_payload.get("extensions")),
+        ("task.extensions", task.get("extensions")),
+        ("task.payload.extensions", task_payload.get("extensions")),
+    )
+    if not any(value is not None for _, value in layers):
+        return None
+    return merge_extensions(*layers)
 
 
 def task_execution_profile(task: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -1585,6 +1605,14 @@ class Handler(BaseHTTPRequestHandler):
                 task_specs.append({"case_id": case_id})
         if not task_specs:
             task_specs = [{}]
+        try:
+            for index, spec in enumerate(task_specs, start=1):
+                if not isinstance(spec, dict):
+                    raise ValueError(f"tasks[{index}] must be an object")
+                merged_dispatch_extensions(payload, spec)
+        except ValueError as exc:
+            self._json(400, {"error": "invalid_task_extensions", "detail": str(exc)})
+            return
         created: list[dict[str, Any]] = []
         existing: list[dict[str, Any]] = []
         now = utc_now()
@@ -1594,8 +1622,13 @@ class Handler(BaseHTTPRequestHandler):
                 case_id = spec.get("case_id")
                 case = cases.get(case_id or "", {})
                 components = spec.get("components") or (case_components(self.server.benchmark_root, case) if case else {})
-                task_payload = dict(payload.get("payload") or {})
-                task_payload.update(spec.get("payload") or {})
+                dispatch_payload = payload.get("payload") or {}
+                spec_payload = spec.get("payload") or {}
+                task_payload = dict(dispatch_payload)
+                task_payload.update(spec_payload)
+                extensions = merged_dispatch_extensions(payload, spec)
+                if extensions is not None:
+                    task_payload["extensions"] = extensions
                 execution_profile = spec.get("execution_profile", task_payload.get("execution_profile"))
                 if execution_profile is not None:
                     task_payload["execution_profile"] = normalize_execution_profile(execution_profile)

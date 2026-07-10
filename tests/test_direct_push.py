@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -122,6 +123,8 @@ class DirectPushTests(unittest.TestCase):
         runner_meta = request_json(self.runner_url + "/api/meta", token=self.runner_token)
         self.assertIn("hub-api-v1", hub_meta["capabilities"])
         self.assertIn("runner-api-v1", runner_meta["capabilities"])
+        self.assertIn("task-extensions-v1", hub_meta["capabilities"])
+        self.assertIn("task-extensions-v1", runner_meta["capabilities"])
         self.assertEqual(runner_meta["concurrency_policy"], "fixed")
 
         with self.assertRaises(HTTPError) as missing_schema:
@@ -138,6 +141,16 @@ class DirectPushTests(unittest.TestCase):
             {
                 "schema_version": 1,
                 "operator": "test",
+                "extensions": {
+                    "org.example.dispatch": {"source": "dispatch"},
+                    "org.example.shared": {"source": "dispatch"},
+                },
+                "payload": {
+                    "extensions": {
+                        "org.example.dispatch-payload": {"source": "dispatch-payload"},
+                        "org.example.shared": {"source": "dispatch-payload"},
+                    }
+                },
                 "tasks": [
                     {
                         "task_id": task_id,
@@ -145,10 +158,18 @@ class DirectPushTests(unittest.TestCase):
                         "setting_id": "setting-a",
                         "run_id": "001",
                         "required_capability": "linux",
+                        "extensions": {
+                            "org.example.task": {"source": "task"},
+                            "org.example.shared": {"source": "task"},
+                        },
                         "payload": {
                             "runner": "shell",
                             "command": "python3 -c \"print('direct push ok')\"",
                             "timeout_seconds": 60,
+                            "extensions": {
+                                "org.example.task-payload": {"source": "task-payload"},
+                                "org.example.shared": {"source": "task-payload"},
+                            },
                         },
                     }
                 ],
@@ -172,6 +193,33 @@ class DirectPushTests(unittest.TestCase):
         self.assertEqual(rows[0]["lease_worker_id"], self.runner_args.worker_id)
         results = request_json(self.controller + "/api/data/new-results?cursor=0", token=self.hub_token)["results"]
         self.assertEqual([row["task_id"] for row in results], [task_id])
+        expected_extensions = {
+            "org.example.dispatch": {"source": "dispatch"},
+            "org.example.dispatch-payload": {"source": "dispatch-payload"},
+            "org.example.task": {"source": "task"},
+            "org.example.task-payload": {"source": "task-payload"},
+            "org.example.shared": {"source": "task-payload"},
+        }
+        with zipfile.ZipFile(results[0]["path"]) as archive:
+            task_payload = json.loads(archive.read("task.json").decode("utf-8"))["payload"]
+            worker_result = json.loads(archive.read("worker-result.json").decode("utf-8"))
+        self.assertEqual(task_payload["extensions"], expected_extensions)
+        self.assertEqual(worker_result["task_extensions"], expected_extensions)
+
+    def test_dispatch_rejects_non_object_extensions(self) -> None:
+        with self.assertRaises(HTTPError) as invalid:
+            request_json(
+                self.controller + "/api/tasks/dispatch",
+                {
+                    "schema_version": 1,
+                    "operator": "test",
+                    "extensions": ["not-an-object"],
+                    "tasks": [{"task_id": "invalid-extensions", "payload": {"runner": "noop"}}],
+                },
+                token=self.hub_token,
+            )
+        self.assertEqual(invalid.exception.code, 400)
+        self.assertEqual(json.loads(invalid.exception.read().decode("utf-8"))["error"], "invalid_task_extensions")
 
     def test_direct_push_rejects_a_second_task_when_reservation_is_full(self) -> None:
         first_id = "direct-resource__case-a__setting-a__run-001"

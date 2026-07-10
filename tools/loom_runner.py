@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
-from loom_contract import CONCURRENCY_POLICIES, CORE_PREVIEW_VERSION, RUNNER_API_VERSION, metadata
+from loom_contract import CONCURRENCY_POLICIES, CORE_PREVIEW_VERSION, RUNNER_API_VERSION, metadata, normalize_extensions
 from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, bearer_headers, is_loopback_host, token_from_env, token_matches
 from loom_resources import normalize_capacity, normalize_capacity_overrides
 
@@ -686,6 +686,8 @@ def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any
         result["phase_result_path"] = "phase-results.json"
     if normalized:
         result["normalized"] = normalized
+    if "extensions" in payload:
+        result["task_extensions"] = normalize_extensions(payload["extensions"], field="payload.extensions")
     write_json(task_dir / "worker-result.json", result)
     zip_path = task_root / f"attempt-{attempt_no:03d}.zip"
     zip_task_dir(task_dir, zip_path)

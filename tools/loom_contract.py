@@ -1,11 +1,12 @@
-"""Internal definitions for the Loom v0.1.0 Core Preview and v1 protocols."""
+"""Internal definitions for the Loom v0.2.0 Core Preview and v1 protocols."""
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
-PRODUCT_VERSION = "0.1.0"
+PRODUCT_VERSION = "0.2.0"
 RELEASE_CHANNEL = "core-preview"
 # Kept as the public metadata key used by existing Preview integrations.
 CORE_PREVIEW_VERSION = PRODUCT_VERSION
@@ -17,6 +18,30 @@ HUB_API_VERSION = 1
 RUNNER_API_VERSION = 1
 CONCURRENCY_POLICIES = {"fixed", "adaptive"}
 FIXED_CONCURRENCY_BACKOFF_ISSUES = {"terminal_resource_insufficient", "rate_limited"}
+
+
+def normalize_extensions(value: Any, *, field: str = "extensions") -> dict[str, Any]:
+    """Return an opaque JSON extension object with stable, safe value types."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    for key in value:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"{field} keys must be non-empty strings")
+    try:
+        # Round-trip so callers cannot retain mutable non-JSON values in task state.
+        return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must contain JSON-compatible values") from exc
+
+
+def merge_extensions(*layers: tuple[str, Any]) -> dict[str, Any]:
+    """Merge opaque extension namespaces, replacing each namespace atomically."""
+    merged: dict[str, Any] = {}
+    for field, value in layers:
+        merged.update(normalize_extensions(value, field=field))
+    return merged
 
 
 def metadata(service: str) -> dict[str, Any]:
@@ -33,6 +58,7 @@ def metadata(service: str) -> dict[str, Any]:
             "shared-host-placement",
             "direct-runner-push",
             "attempt-result-retention",
+            "task-extensions-v1",
         ],
         "runner": [
             "runner-api-v1",
@@ -46,6 +72,7 @@ def metadata(service: str) -> dict[str, Any]:
             "resource-capacity-forwarding",
             "fixed-concurrency",
             "adaptive-concurrency",
+            "task-extensions-v1",
         ],
         "matrix": [
             "matrix-cli-v1",
@@ -55,6 +82,7 @@ def metadata(service: str) -> dict[str, Any]:
             "long-poll",
             "direct-runner-pull",
             "direct-runner-push",
+            "task-extensions-v1",
         ],
         "manifest": [
             "manifest-v1",
@@ -62,6 +90,7 @@ def metadata(service: str) -> dict[str, Any]:
             "repo-phases-v1",
             "retry-contract",
             "execution-profile-v1",
+            "task-extensions-v1",
         ],
     }
     api_version = HUB_API_VERSION if service == "hub" else RUNNER_API_VERSION if service == "runner" else None

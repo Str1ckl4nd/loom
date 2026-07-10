@@ -72,6 +72,72 @@ class ManifestContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported fields"):
             loom_manifest.normalize(manifest, operator="test")
 
+    def test_extensions_merge_by_namespace_with_case_precedence(self) -> None:
+        manifest = {
+            "schema_version": 1,
+            "campaign_id": "extensions",
+            "extensions": {
+                "org.example.campaign": {"source": "campaign"},
+                "org.example.shared": {"source": "campaign", "stale": True},
+            },
+            "defaults": {
+                "runner": "shell",
+                "command": "true",
+                "extensions": {
+                    "org.example.defaults": {"source": "defaults"},
+                    "org.example.shared": {"source": "defaults"},
+                },
+                "payload": {
+                    "extensions": {
+                        "org.example.default-payload": {"source": "default-payload"},
+                        "org.example.shared": {"source": "default-payload"},
+                    }
+                },
+            },
+            "cases": [
+                {
+                    "case_id": "case-a",
+                    "setting_id": "baseline",
+                    "run_id": "001",
+                    "extensions": {
+                        "org.example.case": {"source": "case"},
+                        "org.example.shared": {"source": "case"},
+                    },
+                    "payload": {
+                        "extensions": {
+                            "org.example.case-payload": {"source": "case-payload"},
+                            "org.example.shared": {"source": "case-payload"},
+                        }
+                    },
+                }
+            ],
+        }
+
+        task = loom_manifest.normalize(manifest, operator="test")["tasks"][0]
+
+        self.assertEqual(
+            task["payload"]["extensions"],
+            {
+                "org.example.campaign": {"source": "campaign"},
+                "org.example.defaults": {"source": "defaults"},
+                "org.example.default-payload": {"source": "default-payload"},
+                "org.example.case": {"source": "case"},
+                "org.example.case-payload": {"source": "case-payload"},
+                "org.example.shared": {"source": "case-payload"},
+            },
+        )
+
+    def test_extensions_require_an_object(self) -> None:
+        manifest = {
+            "schema_version": 1,
+            "campaign_id": "invalid-extensions",
+            "defaults": {"runner": "shell", "command": "true", "extensions": ["not-an-object"]},
+            "cases": [{"case_id": "case-a", "setting_id": "baseline", "run_id": "001"}],
+        }
+
+        with self.assertRaisesRegex(ValueError, "defaults.extensions must be an object"):
+            loom_manifest.normalize(manifest, operator="test")
+
 
 if __name__ == "__main__":
     unittest.main()

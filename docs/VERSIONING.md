@@ -4,7 +4,7 @@ Loom separates its product release from the protocols consumed by automation.
 
 ## Current Release
 
-The current public release is **Loom v0.1.0 Core Preview**. The `--version`
+The current public release is **Loom v0.2.0 Core Preview**. The `--version`
 output and authenticated `/api/meta` documents are the canonical discovery
 surface for a deployed process.
 
@@ -12,7 +12,7 @@ surface for a deployed process.
 
 While Loom is pre-1.0, product versions use `0.MINOR.PATCH`:
 
-- `0.1.x`: compatible fixes, documentation, and implementation hardening;
+- `0.1.x`: the original Core Preview baseline and compatible fixes;
 - `0.2.0`, `0.3.0`, and later: additive user-facing capabilities; and
 - `1.0.0`: reserved for a later stability milestone, not merely a feature count.
 

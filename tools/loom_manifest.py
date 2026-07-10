@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from loom_contract import CORE_PREVIEW_VERSION, MANIFEST_SCHEMA_VERSION
+from loom_contract import CORE_PREVIEW_VERSION, MANIFEST_SCHEMA_VERSION, merge_extensions
 from loom_resources import normalize_execution_profile
 
 SAFE_ID = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -262,7 +262,22 @@ def normalize(
         if task_id in task_ids:
             raise ValueError(f"duplicate normalized task_id: {task_id}")
         task_ids.add(task_id)
-        payload = merge_dicts(defaults.get("payload"), case.get("payload"))
+        default_payload = defaults.get("payload")
+        case_payload = case.get("payload")
+        if default_payload is not None and not isinstance(default_payload, dict):
+            raise ValueError("defaults.payload must be an object")
+        if case_payload is not None and not isinstance(case_payload, dict):
+            raise ValueError("case.payload must be an object")
+        payload = merge_dicts(default_payload, case_payload)
+        extension_layers = (
+            ("campaign.extensions", campaign.get("extensions")),
+            ("defaults.extensions", defaults.get("extensions")),
+            ("defaults.payload.extensions", (default_payload or {}).get("extensions")),
+            ("case.extensions", case.get("extensions")),
+            ("case.payload.extensions", (case_payload or {}).get("extensions")),
+        )
+        if any(value is not None for _, value in extension_layers):
+            payload["extensions"] = merge_extensions(*extension_layers)
         runner = str(case.get("runner") or payload.get("runner") or defaults.get("runner") or "repo")
         artifact_paths = string_list(
             case.get("artifact_paths") or case.get("artifacts") or defaults.get("artifact_paths"),

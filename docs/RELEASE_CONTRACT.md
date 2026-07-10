@@ -1,9 +1,9 @@
 # Release Contract
 
-This document defines the stable Core Preview v0.1 release contract. A Loom release must
+This document defines the stable Core Preview v0.2 release contract. A Loom release must
 keep these boundaries intact even while the implementation evolves. The
 versioned public CLI, inventory, manifest, dispatch, token, and capability
-surface is listed in [Core Preview v0.1 Compatibility](CORE_PREVIEW_V1.md) and
+surface is listed in [Core Preview v0.2 Compatibility](CORE_PREVIEW_V1.md) and
 [Versioning](VERSIONING.md).
 
 ## V1 Task Contract
@@ -34,6 +34,13 @@ The Runner always injects the immutable values `LOOM_TASK_ID`,
 `LOOM_RUN_ID`, `LOOM_SETTING_ID`, `LOOM_PHASE_NAME`, and
 `LOOM_PHASE_INDEX`. Phase `args` are rendered from the case/default context
 before dispatch. See [Loom Manifest](TASK_MANIFEST.md) for the full shape.
+
+An optional `extensions` object lets integrations attach opaque JSON metadata
+without depending on Loom internals. Loom preserves the final
+`payload.extensions` value through Hub storage and into both `task.json` and
+`worker-result.json` (`task_extensions`); it never interprets that value for
+scheduling, retries, credentials, commands, or identity. Namespace keys merge
+atomically by documented layer precedence.
 
 Inventory declares `inventory_version: 1` and gives every worker an explicit
 `initial_concurrency`, hard `max_concurrency`, and `concurrency_policy`. The
@@ -86,6 +93,9 @@ Every repository result package includes at least:
 - `phase-results.json` with one status record per executed phase; and
 - `artifact-manifest.json` with relative path, byte length, and SHA-256 for each
   declared artifact copied from the workspace.
+
+When supplied, `payload.extensions` is retained in `task.json` and mirrored as
+`task_extensions` in `worker-result.json`.
 
 Result ZIPs exclude the source checkout. Retried attempts remain queryable by
 the same task ID and distinct `attempt_no`; a later clean attempt cannot erase a

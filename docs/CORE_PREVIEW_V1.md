@@ -1,11 +1,11 @@
-# Core Preview v0.1 Compatibility
+# Core Preview v0.2 Compatibility
 
-Loom Core Preview v0.1 freezes its public integration surface around versioned
+Loom Core Preview v0.2 freezes its public integration surface around versioned
 files, command-line entry points, and authenticated HTTP metadata. Downstream
 automation must use this surface. Importing a function from a file under
 `tools/` is not a supported integration and carries no compatibility promise.
 
-The product release is `v0.1.0`; the inventory, manifest, dispatch, Hub API,
+The product release is `v0.2.0`; the inventory, manifest, dispatch, Hub API,
 and Runner API contracts remain independently versioned at `v1`.
 
 ## Version Discovery
@@ -35,6 +35,8 @@ curl -sS -H "Authorization: Bearer $LOOM_RUNNER_TOKEN" \
 
 The document includes Core Preview version, CLI contract version, supported
 inventory/manifest/dispatch versions, API version, and advertised capabilities.
+Hub and Runner advertise `task-extensions-v1` when they preserve optional
+user-owned `extensions` metadata end to end.
 
 ## Frozen File Contracts
 
@@ -47,6 +49,10 @@ inventory/manifest/dispatch versions, API version, and advertised capabilities.
 Hub rejects unversioned or unsupported dispatch payloads. Matrix rejects
 unversioned inventories. Future incompatible changes require a new version
 number instead of changing v1 interpretation.
+
+The optional `extensions` object is an additive v1 field. It is carried through
+normalization, Hub dispatch, and recovered result packages without changing
+Loom scheduling or execution semantics. See [Loom Manifest](TASK_MANIFEST.md#extensions).
 
 The smallest valid v1 inventory shape is:
 

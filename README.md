@@ -15,7 +15,7 @@ ZIPs.
 [Remote quick start](#remote-quick-start) |
 [Manifest](docs/TASK_MANIFEST.md) |
 [Architecture](docs/ARCHITECTURE.md) |
-[v0.1 release and protocol versions](docs/VERSIONING.md) |
+[v0.2 release and protocol versions](docs/VERSIONING.md) |
 [Release contract](docs/RELEASE_CONTRACT.md) |
 [Support scope](docs/SCOPE.md)
 
@@ -35,7 +35,7 @@ execution flow.
 - **Resource-aware shared-host admission.** A task can reserve CPU, memory,
   disk, and accelerators before it is leased, while `shared` and `exclusive`
   placement make host multiplexing explicit instead of accidental.
-- **Frozen Core Preview v0.1 contracts.** Versioned inventory, manifest, dispatch,
+- **Frozen Core Preview v0.2 contracts.** Versioned inventory, manifest, dispatch,
   token, CLI, and capability-query contracts keep downstream automation on a
   documented surface rather than internal Python helpers.
 - **Remote worker connections that persist.** Bootstrap workers once over SSH,
@@ -48,6 +48,9 @@ execution flow.
 - **Recoverable evidence.** Each attempt keeps its task ID, attempt number,
   worker identity, logs, explicit artifacts, and result ZIP. A later successful
   retry does not erase the earlier failure package.
+- **Integration-owned metadata.** Optional namespaced `extensions` flow from a
+  campaign into recovered task and worker-result records without becoming a
+  hidden scheduling or provider contract.
 - **A small operating footprint.** The implementation uses the Python standard
   library and a SQLite-backed controller; no package installation is required.
 

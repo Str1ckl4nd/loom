@@ -114,6 +114,53 @@ requests, not OS-level limits or a claim of security isolation. See [Resource
 Admission](RESOURCE_ADMISSION.md) for inventory capacity, GPU type constraints,
 and inspection commands.
 
+## Extensions
+
+`extensions` is an optional opaque JSON object for metadata owned by an
+integration, dataset, or downstream result consumer. Loom preserves it from
+manifest normalization through task dispatch and result recovery, but does not
+use it for scheduling, retries, authentication, command construction, or task
+identity. Do not place credentials in it.
+
+Use stable namespace-like keys such as `org.example.dataset` or
+`com.acme.oracle` to avoid collisions with another integration. Each value must
+be JSON-compatible; Loom does not interpolate templates inside it.
+
+```json
+{
+  "extensions": {
+    "org.example.dataset": {
+      "dataset_revision": "2026-07",
+      "trajectory_export": "redacted"
+    },
+    "com.acme.oracle": {
+      "reward_profile": "safety-v3"
+    }
+  }
+}
+```
+
+The field may be declared at campaign, `defaults`, or case/run level. It is
+also accepted in `defaults.payload` and `case.payload` for generated manifests.
+Within a normalized task, precedence is:
+
+```text
+campaign.extensions < defaults.extensions < defaults.payload.extensions
+< case.extensions < case.payload.extensions
+```
+
+Extensions merge only by their top-level key: a later
+`com.acme.oracle` replaces the complete earlier `com.acme.oracle` value. This
+keeps nested merge semantics owned by the extension author. For a raw dispatch
+payload, the corresponding order is `dispatch.extensions`,
+`dispatch.payload.extensions`, `task.extensions`, then
+`task.payload.extensions`.
+
+The normalized task carries the final value as `payload.extensions`. Every
+result ZIP preserves it in `task.json` and mirrors it in
+`worker-result.json` as `task_extensions`, so an exporter can consume it
+without reinterpreting an arbitrary manifest.
+
 ## Parameters And Runtime Injection
 
 The normalizer expands `{campaign_id}`, `{case_id}`, `{setting_id}`, `{run_id}`
