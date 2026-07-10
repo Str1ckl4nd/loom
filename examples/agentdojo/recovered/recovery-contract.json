@@ -1,0 +1,304 @@
+{
+  "schema_version": 1,
+  "kind": "loom-agentdojo-eight-slot-recovery",
+  "contract": {
+    "task_count": 4,
+    "case_count": 2,
+    "run_count": 2,
+    "attempts_per_task": 2,
+    "expected_result_packages": 8
+  },
+  "checks": {
+    "four_task_identities": true,
+    "eight_result_packages": true,
+    "each_task_recovered_twice": true,
+    "each_task_clean_on_attempt_two": true,
+    "download_hashes_match": true,
+    "contract_files_present": true,
+    "second_attempts_have_agentdojo_output": true
+  },
+  "packages": [
+    {
+      "task_id": "agentdojo-eight-slot-release__workspace-user-task-0__no-defense__run-001",
+      "case_id": "workspace-user-task-0",
+      "run_id": "001",
+      "setting_id": "no-defense",
+      "attempt_no": 1,
+      "verdict": "run_error",
+      "exit_code": 1,
+      "phase_results": [
+        {
+          "phase": "prepare",
+          "phase_index": 1,
+          "exit_code": 1
+        }
+      ],
+      "artifacts": [],
+      "agentdojo_output": null
+    },
+    {
+      "task_id": "agentdojo-eight-slot-release__workspace-user-task-0__no-defense__run-001",
+      "case_id": "workspace-user-task-0",
+      "run_id": "001",
+      "setting_id": "no-defense",
+      "attempt_no": 2,
+      "verdict": "clean",
+      "exit_code": 0,
+      "phase_results": [
+        {
+          "phase": "prepare",
+          "phase_index": 1,
+          "exit_code": 0
+        },
+        {
+          "phase": "evaluate",
+          "phase_index": 2,
+          "exit_code": 0
+        },
+        {
+          "phase": "collect",
+          "phase_index": 3,
+          "exit_code": 0
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "agentdojo-artifact-index.json",
+          "bytes": 299,
+          "sha256": "fcd47bbab232c6cadae90d6b82e9da7969250ffed158394ff39229445b410520"
+        },
+        {
+          "path": "loom-agentdojo-output/workspace-user-task-0/001/local/workspace/user_task_0/none/none.json",
+          "bytes": 1648,
+          "sha256": "91816250483ddf859d5246163957403bf29263e340c4f8213a3fb849d8b3dba0"
+        }
+      ],
+      "agentdojo_output": {
+        "case_id": "workspace-user-task-0",
+        "run_id": "001",
+        "attempt_no": 2,
+        "files": [
+          {
+            "path": "workspace-user-task-0/001/local/workspace/user_task_0/none/none.json",
+            "bytes": 1648,
+            "sha256": "91816250483ddf859d5246163957403bf29263e340c4f8213a3fb849d8b3dba0"
+          }
+        ]
+      }
+    },
+    {
+      "task_id": "agentdojo-eight-slot-release__workspace-user-task-0__no-defense__run-002",
+      "case_id": "workspace-user-task-0",
+      "run_id": "002",
+      "setting_id": "no-defense",
+      "attempt_no": 1,
+      "verdict": "run_error",
+      "exit_code": 1,
+      "phase_results": [
+        {
+          "phase": "prepare",
+          "phase_index": 1,
+          "exit_code": 1
+        }
+      ],
+      "artifacts": [],
+      "agentdojo_output": null
+    },
+    {
+      "task_id": "agentdojo-eight-slot-release__workspace-user-task-0__no-defense__run-002",
+      "case_id": "workspace-user-task-0",
+      "run_id": "002",
+      "setting_id": "no-defense",
+      "attempt_no": 2,
+      "verdict": "clean",
+      "exit_code": 0,
+      "phase_results": [
+        {
+          "phase": "prepare",
+          "phase_index": 1,
+          "exit_code": 0
+        },
+        {
+          "phase": "evaluate",
+          "phase_index": 2,
+          "exit_code": 0
+        },
+        {
+          "phase": "collect",
+          "phase_index": 3,
+          "exit_code": 0
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "agentdojo-artifact-index.json",
+          "bytes": 299,
+          "sha256": "6d96d92637c3de00954c372cdbe7ca1609d4b1af5e0432d2684fada3cb8372f3"
+        },
+        {
+          "path": "loom-agentdojo-output/workspace-user-task-0/002/local/workspace/user_task_0/none/none.json",
+          "bytes": 1646,
+          "sha256": "9b3f023ba2ce06425796ad035c28a5259f3a40272205c71d260634efd581e9ec"
+        }
+      ],
+      "agentdojo_output": {
+        "case_id": "workspace-user-task-0",
+        "run_id": "002",
+        "attempt_no": 2,
+        "files": [
+          {
+            "path": "workspace-user-task-0/002/local/workspace/user_task_0/none/none.json",
+            "bytes": 1646,
+            "sha256": "9b3f023ba2ce06425796ad035c28a5259f3a40272205c71d260634efd581e9ec"
+          }
+        ]
+      }
+    },
+    {
+      "task_id": "agentdojo-eight-slot-release__workspace-user-task-1__no-defense__run-001",
+      "case_id": "workspace-user-task-1",
+      "run_id": "001",
+      "setting_id": "no-defense",
+      "attempt_no": 1,
+      "verdict": "run_error",
+      "exit_code": 1,
+      "phase_results": [
+        {
+          "phase": "prepare",
+          "phase_index": 1,
+          "exit_code": 1
+        }
+      ],
+      "artifacts": [],
+      "agentdojo_output": null
+    },
+    {
+      "task_id": "agentdojo-eight-slot-release__workspace-user-task-1__no-defense__run-001",
+      "case_id": "workspace-user-task-1",
+      "run_id": "001",
+      "setting_id": "no-defense",
+      "attempt_no": 2,
+      "verdict": "clean",
+      "exit_code": 0,
+      "phase_results": [
+        {
+          "phase": "prepare",
+          "phase_index": 1,
+          "exit_code": 0
+        },
+        {
+          "phase": "evaluate",
+          "phase_index": 2,
+          "exit_code": 0
+        },
+        {
+          "phase": "collect",
+          "phase_index": 3,
+          "exit_code": 0
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "agentdojo-artifact-index.json",
+          "bytes": 299,
+          "sha256": "8def199095d948d9b85284e74e942f6f341518ff80b45226ffb57293e41b3233"
+        },
+        {
+          "path": "loom-agentdojo-output/workspace-user-task-1/001/local/workspace/user_task_1/none/none.json",
+          "bytes": 1668,
+          "sha256": "15f10e45cd4644646cc503aed735b9212141d765c8b62098f854cb78412e6c83"
+        }
+      ],
+      "agentdojo_output": {
+        "case_id": "workspace-user-task-1",
+        "run_id": "001",
+        "attempt_no": 2,
+        "files": [
+          {
+            "path": "workspace-user-task-1/001/local/workspace/user_task_1/none/none.json",
+            "bytes": 1668,
+            "sha256": "15f10e45cd4644646cc503aed735b9212141d765c8b62098f854cb78412e6c83"
+          }
+        ]
+      }
+    },
+    {
+      "task_id": "agentdojo-eight-slot-release__workspace-user-task-1__no-defense__run-002",
+      "case_id": "workspace-user-task-1",
+      "run_id": "002",
+      "setting_id": "no-defense",
+      "attempt_no": 1,
+      "verdict": "run_error",
+      "exit_code": 1,
+      "phase_results": [
+        {
+          "phase": "prepare",
+          "phase_index": 1,
+          "exit_code": 1
+        }
+      ],
+      "artifacts": [],
+      "agentdojo_output": null
+    },
+    {
+      "task_id": "agentdojo-eight-slot-release__workspace-user-task-1__no-defense__run-002",
+      "case_id": "workspace-user-task-1",
+      "run_id": "002",
+      "setting_id": "no-defense",
+      "attempt_no": 2,
+      "verdict": "clean",
+      "exit_code": 0,
+      "phase_results": [
+        {
+          "phase": "prepare",
+          "phase_index": 1,
+          "exit_code": 0
+        },
+        {
+          "phase": "evaluate",
+          "phase_index": 2,
+          "exit_code": 0
+        },
+        {
+          "phase": "collect",
+          "phase_index": 3,
+          "exit_code": 0
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "agentdojo-artifact-index.json",
+          "bytes": 299,
+          "sha256": "7b7c37f4763514c151d769943f904e3862255ad849e6b6b577bf2d847e23326b"
+        },
+        {
+          "path": "loom-agentdojo-output/workspace-user-task-1/002/local/workspace/user_task_1/none/none.json",
+          "bytes": 1668,
+          "sha256": "399672572c8dd60022224a63c59c9ad6d427c2e3eab8b9367e2a03d3f2ea4416"
+        }
+      ],
+      "agentdojo_output": {
+        "case_id": "workspace-user-task-1",
+        "run_id": "002",
+        "attempt_no": 2,
+        "files": [
+          {
+            "path": "workspace-user-task-1/002/local/workspace/user_task_1/none/none.json",
+            "bytes": 1668,
+            "sha256": "399672572c8dd60022224a63c59c9ad6d427c2e3eab8b9367e2a03d3f2ea4416"
+          }
+        ]
+      }
+    }
+  ],
+  "redaction": {
+    "omitted": [
+      "hostnames",
+      "worker identifiers",
+      "timestamps",
+      "command stdout and stderr",
+      "raw model output",
+      "result URLs and IDs"
+    ]
+  }
+}

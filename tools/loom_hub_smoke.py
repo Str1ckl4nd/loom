@@ -81,6 +81,7 @@ def main(argv: list[str]) -> int:
         request_json(
             base + "/api/tasks/dispatch",
             {
+                "schema_version": 1,
                 "operator": "local-smoke",
                 "tasks": [
                     {

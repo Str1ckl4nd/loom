@@ -1,172 +1,189 @@
 # Loom Manifest
 
-This control plane does not infer benchmark cases from a target repository.
-Handoff owners or agents must normalize work into explicit campaign, case, and
-run records before dispatch.
+Loom does not infer benchmark work from a repository. A campaign author expands
+the work into explicit runnable records before dispatch.
 
-## Required Granularity
+## Identity And Schema
 
-Every runnable unit must have:
+Every JSON campaign must currently declare `schema_version: 1` and every
+runnable record must resolve to:
 
-- `campaign_id`: one evaluation campaign or experiment batch.
-- `case_id`: the benchmark case being evaluated.
-- `setting_id`: model, defense, prompt, environment, or other setting slice.
-- `run_id`: one concrete run of that case under that setting.
+- `campaign_id`: one evaluation batch;
+- `case_id`: one benchmark problem or scenario;
+- `setting_id`: one model, defense, prompt, or environment slice; and
+- `run_id`: one concrete repetition of that case and setting.
 
-All four fields are mandatory. The normalizer rejects generated/missing IDs and
-rejects duplicate task IDs after normalization.
-
-The normalizer builds task IDs as:
+Loom normalizes those fields into a stable ID:
 
 ```text
 {campaign_id}__{case_id}__{setting_id}__run-{run_id}
 ```
 
-That ID is the recovery boundary. Operators can query, retry, cancel, or inspect
-one `case_id` / `run_id` without touching other runs.
+The same task ID survives retry. `attempt_no` is assigned by Hub and is the
+separate execution/recovery identity. A result package is therefore always
+addressable by `(task_id, attempt_no)`.
 
-## Manifest Shape
+## V1 Repository Phases
 
-Use JSON for campaign manifests:
+`runner: "repo"` materializes a declared source checkout and executes ordered
+named phases. `defaults.phases` provides the common sequence; a case can update
+one by matching `name`, or append another phase with a new name.
 
 ```json
 {
-  "campaign_id": "agentdojo-documentation",
+  "schema_version": 1,
+  "campaign_id": "example-release",
   "source": {
     "type": "git",
-    "url": "https://github.com/ethz-spylab/agentdojo.git",
-    "ref": "main",
+    "url": "https://github.com/example/project.git",
+    "ref": "v1.2.3",
     "depth": 1
   },
   "defaults": {
-    "required_capability": "source-github-com",
-    "timeout_seconds": 120,
-    "retry_policy": {
-      "max_attempts": 3,
-      "retry_categories": ["network_unavailable"],
-      "different_worker": true
-    },
-    "expected": {
-      "state": "clean"
-    },
-    "artifact_paths": [
-      "agentdojo-source-check.json"
-    ],
-    "commands": [
-      "test -f README.md",
-      "test -f pyproject.toml",
-      "test -f src/agentdojo/scripts/benchmark.py",
-      "printf '{\"ok\": true}\\n' > agentdojo-source-check.json"
+    "runner": "repo",
+    "required_capability": "linux",
+    "env": {"LOG_LEVEL": "info"},
+    "artifact_paths": ["reports/**"],
+    "phases": [
+      {
+        "name": "prepare",
+        "command": ["python3", "-m", "pip", "install", "."],
+        "timeout_seconds": 600
+      },
+      {
+        "name": "evaluate",
+        "command": ["python3", "run_eval.py"],
+        "args": ["--case", "{case_id}", "--run", "{run_id}"],
+        "env": {"EVAL_MODE": "default"},
+        "artifact_paths": ["reports/{case_id}/{run_id}/**"],
+        "timeout_seconds": 1800
+      },
+      {
+        "name": "collect",
+        "command": "python3 collect.py",
+        "continue_on_error": false
+      }
     ]
   },
   "cases": [
     {
-      "case_id": "agentdojo-source-layout",
-      "setting_id": "documentation",
-      "run_id": "001"
+      "case_id": "case-a",
+      "setting_id": "baseline",
+      "run_id": "001",
+      "phases": [
+        {"name": "evaluate", "args": ["--case", "{case_id}", "--run", "{run_id}", "--seed", "7"]}
+      ]
     }
   ]
 }
 ```
 
-This is a documentation-only source-delivery example. It checks the public
-AgentDojo checkout layout and writes one explicit artifact; it does not install
-or invoke AgentDojo, call a model, or represent an end-to-end benchmark result.
-See [AgentDojo Example](AGENTDOJO_EXAMPLE.md) for the walkthrough.
+Allowed phase fields are `name`, `command`, `args`, `cwd`, `env`,
+`timeout_seconds`, `continue_on_error`, and `artifact_paths`. `command` accepts
+a shell string or an executable argument list; `args` are appended safely for
+list commands and shell-quoted for string commands. `cwd` must be a relative
+path inside the materialized workspace.
 
-For large batches, JSONL is also allowed. Each line is one run record and must
-repeat the same explicit `campaign_id`; top-level defaults are not available.
+Legacy `commands` remain supported when `phases` is absent. New manifests should
+use phases so the prepare, evaluate, and collection contract is visible to the
+controller, operator, and result consumer.
 
-`runner: "repo"` requires `source` and may contain ordered `commands`.
-`runner: "shell"` requires one `command` and is useful for infrastructure or
-resource probes that do not need a checkout. Handoff manifests must choose the
-runner explicitly when they are not repository runs.
+## Parameters And Runtime Injection
 
-## Retry And Validation Contract
+The normalizer expands `{campaign_id}`, `{case_id}`, `{setting_id}`, `{run_id}`
+and any default/case field in phase strings, args, paths, and environment
+values. Environment precedence is:
 
-`retry_policy` is optional and belongs to task execution, not to the cloud
-runner. Its fields are:
-
-- `max_attempts`: total task attempts, including the first one.
-- `retry_categories`: controller issue categories that permit automatic retry.
-- `different_worker`: exclude the failed worker from the next claim. If no
-  other active capable worker exists, the task remains failed instead of
-  waiting forever.
-
-Repo tasks should normally retry only transient `network_unavailable` failures.
-Do not automatically retry authentication, token balance, or resource failures
-unless the handoff explicitly defines why another attempt can recover.
-
-`expected` is an optional validation contract consumed by the matrix runner:
-
-- `state`: required final task state.
-- `attempt_no`: exact final attempt number.
-- `min_result_count`: minimum independently recoverable result packages.
-- `min_distinct_workers`: minimum workers represented by those results.
-
-Loom Runner exposes the immutable runtime values `LOOM_TASK_ID`,
-`LOOM_ATTEMPT_NO`, and `LOOM_WORKER_ID` to shell and repo
-commands. This allows deterministic retry-aware jobs without shared local
-marker files.
-
-## Normalize And Dispatch
-
-Normalize:
-
-```bash
-python3 tools/loom_manifest.py agentdojo-example.json \
-  --operator documentation \
-  --output agentdojo-example.dispatch.json
+```text
+defaults.env < case.env < default phase.env < case phase.env < Loom runtime env
 ```
 
-Dispatch:
+The final runtime values cannot be overwritten by a manifest:
+
+```text
+LOOM_TASK_ID
+LOOM_ATTEMPT_NO
+LOOM_WORKER_ID
+LOOM_CAMPAIGN_ID
+LOOM_CASE_ID
+LOOM_RUN_ID
+LOOM_SETTING_ID
+LOOM_PHASE_NAME
+LOOM_PHASE_INDEX
+```
+
+Use `args` for phase-specific main-script parameters and `env` for compatible
+tool configuration. Do not put credentials in a manifest, command URL, or task
+ID. Keep credentials in the remote worker environment.
+
+## Retries And Expected Results
+
+`retry_policy` belongs to an execution identity, not to a cloud host:
+
+- `max_attempts`: total attempts including the first;
+- `retry_categories`: Hub issue categories that permit automatic retry; and
+- `different_worker`: require the retry to land on another capable active
+  worker, otherwise retain the failed task rather than waiting forever.
+
+Normally retry only transient categories such as `network_unavailable`. Do not
+blindly retry `auth_failed`, `token_balance_insufficient`, or resource errors.
+
+`expected` is an optional regression contract:
+
+- `state`: required final task state;
+- `attempt_no`: required final attempt;
+- `min_result_count`: minimum retained result ZIPs; and
+- `min_distinct_workers`: minimum workers represented by those ZIPs.
+
+When a repository attempt starts, its working directory is fresh. Its result ZIP
+contains `task.json`, `worker-result.json`, `phase-results.json`,
+`artifact-manifest.json`, command logs, and explicit declared artifacts. The
+source checkout is excluded.
+
+## Selection, Normalize, And Dispatch
+
+Normalize all tasks or narrow the selected identity dimensions before dispatch:
 
 ```bash
+python3 tools/loom_manifest.py campaign.json \
+  --case-id case-a \
+  --run-id 001 \
+  --setting-id baseline \
+  --operator my-team \
+  --output campaign.dispatch.json
+```
+
+The three selectors are repeatable. An empty selection is an error rather than a
+quiet no-op.
+
+For an authenticated Hub:
+
+```bash
+export LOOM_HUB_TOKEN='...'
+
 python3 tools/loom_hub.py dispatch-spec \
   --controller http://CONTROL_HOST:8765 \
-  agentdojo-example.dispatch.json
+  campaign.dispatch.json
+
+curl -sS \
+  -H "Authorization: Bearer $LOOM_HUB_TOKEN" \
+  'http://CONTROL_HOST:8765/api/tasks?case_id=case-a&setting_id=baseline&run_id=001'
 ```
 
-Query one run directly by its normalized fields:
+Retry one identity without mutating neighboring cases/runs:
 
 ```bash
-curl -sS 'http://CONTROL_HOST:8765/api/tasks?case_id=agentdojo-source-layout&setting_id=documentation&run_id=001'
+python3 tools/loom_hub.py retry-task \
+  --controller http://CONTROL_HOST:8765 \
+  --task-id example-release__case-a__baseline__run-001
 ```
 
-Retry one run:
+Earlier failure packages remain downloadable after a later clean retry. See
+[Release Contract](RELEASE_CONTRACT.md) for Direct Runner push, authentication,
+and release-gate requirements.
 
-```bash
-curl -sS -X POST http://CONTROL_HOST:8765/api/admin/retry-task \
-  -H 'Content-Type: application/json' \
-  -d '{"task_id":"agentdojo-documentation__agentdojo-source-layout__documentation__run-001","operator":"operator"}'
-```
+## JSONL
 
-Download the result identified by the task row's `result_id`:
-
-```bash
-curl -fSLo result.zip \
-  http://CONTROL_HOST:8765/api/results/result-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
-
-List every retained attempt result for one run, or one exact attempt:
-
-```bash
-curl -sS 'http://CONTROL_HOST:8765/api/data/new-results?cursor=0&task_id=agentdojo-documentation__agentdojo-source-layout__documentation__run-001'
-curl -sS 'http://CONTROL_HOST:8765/api/data/new-results?cursor=0&task_id=agentdojo-documentation__agentdojo-source-layout__documentation__run-001&attempt_no=2'
-```
-
-Retry keeps the same task/recovery identity and increments `attempt_no`. Every
-uploaded result row also records its own `attempt_no`, so earlier failure
-packages remain independently queryable and downloadable after a later attempt
-succeeds. Manual retry clears automatic worker exclusions unless
-`preserve_excluded_workers` is explicitly requested.
-
-## Handoff Rules
-
-- Never use a vague task like "run the benchmark." Expand it into case/run rows.
-- Put all source materialization details in `source`; do not put tokens in URLs.
-- Put credentials only in worker environment variables referenced by `token_env`
-  or command-specific environment names.
-- Keep artifacts explicit. Result ZIPs intentionally exclude full repo checkouts.
-- If a run cannot be represented at case/run granularity, split the source
-  benchmark first, then normalize.
+JSONL is available for large flat batches. Each line must carry the same explicit
+`campaign_id` and its own case/run identity; top-level defaults are not
+available in JSONL mode.

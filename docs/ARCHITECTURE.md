@@ -2,163 +2,141 @@
 
 ## Roles
 
-- Controller: owns task dispatch, leases, state transitions, worker
-  `desired_concurrency`, result intake, scoring import, admin overrides, control
-  logs, and data queries.
-- Worker: registers capabilities, heartbeats, claims tasks, runs local payloads,
-  uploads ZIP result packages, and reports completion/failure. Workers advertise
-  a hard concurrency cap but do not own desired concurrency.
-- Operator: may override state, cancel/retry work, and block/unblock workers.
+- **Operator** owns existing hosts, private routing, credentials, and cloud
+  lifecycle.
+- **Hub** owns dispatch, leases, task state, desired worker concurrency, retries,
+  result intake, result queries, and audit events.
+- **Runner** advertises capability/capacity, executes a leased task, renews its
+  lease, uploads an attempt ZIP, and reports facts back to Hub.
 
-## Infrastructure Boundary
+Hub is the only task-state owner. A Runner never owns an independent task queue.
 
-The architecture begins with existing hosts. An operator or external
-infrastructure system supplies controller and worker endpoints through an
-inventory. Provider APIs for creating, resizing, billing, or deleting cloud
-resources are outside the supported architecture and are not planned features.
+## Connection Modes
 
-The retained Tencent and AWS lifecycle scripts are historical validation
-references only. Maintained provisioning belongs in a contributor-owned pull
-request rather than in the controller/worker contract.
+The inventory selects a mode per Runner:
 
-## Control Plane
+| Mode | Transport after bootstrap | Best use |
+| --- | --- | --- |
+| `ssh-start` | Hub HTTP pull | Start a persistent Runner once over SSH; do not open a new SSH command for every task. |
+| `long-poll` | Hub HTTP long-poll | Reduce idle request churn while preserving pull scheduling. |
+| `direct-worker-api` / `pull` | Runner HTTP control endpoint plus Hub pull | Reach a persistent Runner API while it claims work normally. |
+| `direct-worker-api` / `push` | Hub-to-Runner authenticated POST | Let Hub lease one exact eligible task and actively deliver it to the Runner. |
 
-Workers can be registered and started through a host registry, then use
-controller-owned scheduling. Supported connection modes:
+`ssh_control_persist` enables SSH `ControlMaster`/`ControlPersist` during
+bootstrap. It does not become the task protocol.
 
-- `ssh-start`: the runner uses SSH to deploy/start a long-lived worker process.
-  Task scheduling then uses HTTP pull; SSH is not used for every task.
-- `long-poll`: same bootstrap as `ssh-start`, but empty claim requests stay open
-  briefly so the worker keeps a stable controller request instead of tight
-  polling.
-- `direct-worker-api`: SSH starts a worker-side HTTP control endpoint. The
-  runner or controller-side automation can call that endpoint to register the
-  worker or start its pull loop. Task state still lives in the controller.
-
-SSH bootstrap supports `ControlMaster`/`ControlPersist` through inventory
-configuration, so repeated deploy/start commands can reuse the same SSH control
-connection.
-
-Controller placement is also inventory-driven:
-
-- `ssh-start`: deploy and start the controller on a remote host.
-- `prestarted`: use an existing controller API without starting a process.
-- `local-process`: start the controller beside the matrix runner. Remote workers
-  must receive an independently reachable `controller_worker_url` (for example,
-  through a private route or operator-managed tunnel).
-
-Default workers use pull-based scheduling:
+### Pull Flow
 
 ```text
-worker -> register
-worker -> heartbeat
-worker -> claim_task
-controller -> task + lease
-worker -> start / renew / complete / fail
+Runner -> register / heartbeat / claim
+Hub    -> leased task
+Runner -> start / renew / upload / complete or fail
 ```
 
-This keeps the controller as the only task-state owner. Even when
-`direct-worker-api` is enabled, the worker endpoint accepts control commands only
-to register or start/continue the worker loop; it does not become an independent
-task queue.
-
-## Concurrency Control
-
-Worker count, controller placement, and worker-local concurrency are independent:
-
-- any number of workers can register with the controller;
-- the controller can be local, remote, or on a cloud host as long as workers can
-  reach its HTTP API;
-- each worker has a hard `max_concurrency`, while the controller stores and
-  returns `desired_concurrency`.
-
-Claiming is capacity-bound:
+### Direct Push Flow
 
 ```text
-claim_limit = min(worker_request, desired_concurrency, max_concurrency) - active_runs
+operator -> Hub push-task(task_id, worker_id)
+Hub      -> eligibility + capacity check + atomic lease
+Hub      -> Direct Runner /api/tasks/execute (leased task only)
+Runner   -> Hub start / renew / upload / complete or fail
 ```
 
-Workers run claimed tasks concurrently up to that returned capacity.
+The Direct Runner validates that the task is assigned to its own worker ID and
+does not accept an active push while its pull loop is running. Hub retains the
+lease if delivery outcome is unknown, avoiding duplicate execution. Normal lease
+recovery handles a genuinely lost Runner.
 
-Workers execute one complete claim batch at a time. They drain the batch before
-claiming again, so a concurrency level is proven by that many simultaneously
-claimed runs rather than by unrelated sequential successes.
+## Authentication And Placement
 
-After result import, the controller updates worker tuning from the result ZIP:
+Hub binds to `127.0.0.1` by default. A non-loopback Hub bind requires
+`LOOM_HUB_TOKEN` (or `--auth-token-env NAME`). The same bearer token authenticates
+Hub API clients and Runners.
 
-- `resource_capacity` from worker heartbeat/result metadata;
-- `resource_usage` from the completed task;
-- verdict and known issue classification from stdout/stderr.
+Direct Runner binds to `127.0.0.1` by default. A non-loopback Direct API requires
+the separate `LOOM_RUNNER_TOKEN` (or `--direct-api-token-env NAME`). Hub stores
+only the token *environment variable name* associated with a Direct Runner; it
+does not receive or persist the token in inventory data.
 
-On Linux, each child command is measured independently with GNU `time -v`.
-CPU time and peak RSS are aggregated per task without using process-lifetime
-`RUSAGE_CHILDREN` counters, which would mix concurrent runs. The first healthy
-concurrency-1 result is frozen as the single-run baseline; later contended runs
-do not move the theoretical estimate.
+The Core Preview transport is HTTP with bearer authentication. Keep it on private
+addresses or behind an operator-managed TLS proxy and firewall when traffic
+crosses a host boundary. TLS termination, certificate lifecycle, and identity
+provider integration are outside this release contract.
 
-Healthy runs use midpoint probes until the theoretical max, then one-by-one
-probes until `theoretical_max + 10`. Unhealthy runs reduce concurrency and write
-warning logs.
+## Task And Attempt State
 
-Tasks may declare a bounded category-based retry policy. After a matching
-failure is imported, the controller records that attempt's result, increments
-the task attempt, and requeues it. With `different_worker` enabled, the failed
-worker is excluded and the controller verifies that another active capable
-worker exists before requeueing. This prevents both same-host retry loops and
-permanently queued work when only one suitable worker is available.
+Loom derives a stable `task_id` from campaign/case/setting/run. Hub assigns an
+`attempt_no`; automatic retry keeps the task ID, increments only the attempt,
+and retains the old result package.
+
+Leases are time-bound. Runners renew them during execution and upload. The Hub
+enforces worker capability, a configured hard `max_concurrency`, and
+controller-owned `desired_concurrency` before either pull claim or Direct Push.
+
+The capacity check is conceptually:
+
+```text
+active < min(desired_concurrency, max_concurrency)
+```
+
+`active` includes Hub-recorded leased/running work so a Direct Push cannot race
+past capacity merely because a Runner has not yet sent its next heartbeat.
+
+### Concurrency Policies
+
+The inventory chooses `fixed` or `adaptive` for each worker. Both start at the
+declared `initial_concurrency`, and neither can exceed `max_concurrency`.
+
+- `fixed` holds its configured level after healthy or ordinary failed tasks. It
+  backs off one level only for a classified resource-insufficient or rate-limit
+  result.
+- `adaptive` uses the existing resource-aware probe sequence to change Hub
+  `desired_concurrency` after results.
+
+The Runner independently clamps Hub responses to its own maximum. This makes
+the maximum a hard safety boundary even if a controller is misconfigured.
 
 ## Repo Task Delivery
 
-The `repo` runner is the end-to-end task delivery path. A task payload describes:
+The V1 repository contract is phase-oriented:
 
-- `source`: a git URL/ref/depth or a local materialization source.
-- `commands`: ordered shell commands with optional per-command `cwd`, `env`, and
-  `timeout_seconds`.
-- `artifact_paths`: relative files, directories, or glob patterns to copy into
-  the result package.
+```text
+materialize source -> prepare -> evaluate -> collect -> declared artifacts -> ZIP
+```
 
-Workers clone or copy the source into a per-task workspace, execute commands, and
-zip only controller/worker metadata, command logs, and explicit artifacts. The
-workspace checkout itself is intentionally excluded from result ZIPs.
+Each attempt gets a fresh work directory. The Runner writes phase exit records,
+copies only declared relative artifacts, calculates their SHA-256 values, and
+excludes the checkout itself from the ZIP. A phase may have its own command,
+args, cwd, env, timeout, error-continuation setting, and artifact patterns.
 
-Private git repositories use a `source.token_env` name. The worker reads that
-environment variable and supplies it through a temporary `GIT_ASKPASS` helper.
-The token value is not written into task JSON, command logs, or result ZIPs.
+See [Loom Manifest](TASK_MANIFEST.md) for parameter precedence and the exact
+runtime environment injection contract.
 
-## Data Plane
+## Data And Recovery Plane
 
-Result packages are uploaded as ZIP files. The controller imports the ZIP,
-extracts a compatible summary when present, and stores a cursor-addressable
-result row with the task's `attempt_no`. Multiple attempt packages retain the
-same task ID but have independent result IDs, hashes, verdicts, and worker IDs.
+Hub stores a cursor-addressable row for each uploaded ZIP. It records task ID,
+attempt number, worker identity, byte length, SHA-256, verdict, and parsed
+metadata. A recovery client downloads each package by result ID and verifies
+both byte length and hash.
 
-`GET /api/results/{result_id}` downloads one ZIP. Temporary-cloud validation
-downloads every result and verifies byte length and SHA-256 before returning.
-Any later host teardown is owned by the operator's infrastructure workflow.
+Required repository-package files are:
 
-Supported result hints:
+- `task.json`;
+- `worker-result.json`;
+- `phase-results.json`; and
+- `artifact-manifest.json`.
 
-- `worker-result.json`
-- `artifact-summary.json`
-- `case-scheduler-summary.json`
-- `score-summary.json`
+Result packages may also include command logs and explicit artifacts. The fixed
+[AgentDojo release fixture](AGENTDOJO_EXAMPLE.md) validates recovery of eight
+packages across two cases, two runs, and two attempts.
 
-## Control Logs
+## Infrastructure Boundary
 
-Control logs are stored in SQLite `control_logs` and appended to a JSONL file
-when the server is started with `--control-log`.
+Loom starts after hosts exist. Cloud creation, rescaling, cost selection,
+termination, billing, VPC/security-group management, and provider credentials
+are not supported Loom features and are not on the roadmap. The retained
+Tencent/AWS lifecycle helpers are historical references only. A maintained
+provider integration must be proposed and owned in a separate pull request.
 
-Known issue categories:
-
-- `terminal_resource_insufficient`
-- `token_balance_insufficient`
-- `rate_limited`
-- `auth_failed`
-- `network_unavailable`
-- `run_error`
-- `automatic_retry`
-
-## Query Boundary
-
-The generic data API uses field allowlists instead of raw SQL. This keeps local
-automation flexible without exposing arbitrary database mutation through HTTP.
+See [Loom Scope](SCOPE.md) and [Release Contract](RELEASE_CONTRACT.md) for the
+operational boundary.

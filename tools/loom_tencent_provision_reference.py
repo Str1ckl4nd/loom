@@ -306,6 +306,8 @@ def write_inventory(args: argparse.Namespace, out_dir: Path, key_path: str, inst
                 "memory_gb": inst.get("Memory"),
                 "system_disk_type": args.worker_system_disk_type[idx - 1],
                 "max_concurrency": args.worker_max_concurrency[idx - 1],
+                "initial_concurrency": 1,
+                "concurrency_policy": "adaptive",
                 "serve_port": args.worker_command_port,
                 "command_port": args.worker_command_port,
                 "capabilities": ["linux", "tencent", instance_type.replace(".", "-").lower()],
@@ -331,6 +333,7 @@ def write_inventory(args: argparse.Namespace, out_dir: Path, key_path: str, inst
         controller_public_url = args.controller_public_url
         controller_worker_url = args.controller_worker_url or controller_public_url
     inventory = {
+        "inventory_version": 1,
         "connection_defaults": {
             "ssh_control_persist": args.ssh_control_persist,
         },

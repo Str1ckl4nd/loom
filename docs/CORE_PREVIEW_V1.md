@@ -1,0 +1,102 @@
+# Core Preview v1 Compatibility
+
+Loom Core Preview v1 freezes its public integration surface around versioned
+files, command-line entry points, and authenticated HTTP metadata. Downstream
+automation must use this surface. Importing a function from a file under
+`tools/` is not a supported integration and carries no compatibility promise.
+
+## Version Discovery
+
+The four public commands report their contract version without requiring a
+running controller:
+
+```bash
+python3 tools/loom_manifest.py --version
+python3 tools/loom_matrix.py --version
+python3 tools/loom_hub.py --version
+python3 tools/loom_runner.py --version
+```
+
+An authenticated Hub and Direct Runner expose their runtime capability document:
+
+```bash
+python3 tools/loom_hub.py capabilities \
+  --controller http://CONTROL_HOST:8765
+
+curl -sS -H "Authorization: Bearer $LOOM_HUB_TOKEN" \
+  http://CONTROL_HOST:8765/api/meta
+
+curl -sS -H "Authorization: Bearer $LOOM_RUNNER_TOKEN" \
+  http://RUNNER_HOST:9876/api/meta
+```
+
+The document includes Core Preview version, CLI contract version, supported
+inventory/manifest/dispatch versions, API version, and advertised capabilities.
+
+## Frozen File Contracts
+
+| File | Required version field | Current version |
+| --- | --- | --- |
+| Inventory JSON | `inventory_version` | `1` |
+| Campaign manifest JSON or JSONL record | `schema_version` | `1` |
+| Normalized dispatch payload | `schema_version` | `1` |
+
+Hub rejects unversioned or unsupported dispatch payloads. Matrix rejects
+unversioned inventories. Future incompatible changes require a new version
+number instead of changing v1 interpretation.
+
+The smallest valid v1 inventory shape is:
+
+```json
+{
+  "inventory_version": 1,
+  "controller": {"connection_mode": "prestarted"},
+  "controller_public_url": "http://CONTROL_HOST:8765",
+  "workers": [
+    {
+      "worker_id": "worker-a",
+      "host": "WORKER_HOST",
+      "connection_mode": "ssh-start",
+      "max_concurrency": 4,
+      "initial_concurrency": 2,
+      "concurrency_policy": "fixed",
+      "capabilities": ["linux"]
+    }
+  ]
+}
+```
+
+`1 <= initial_concurrency <= max_concurrency` is required. `max_concurrency`
+is an enforced Runner and Hub cap, not a tuning hint.
+
+## Concurrency Policy
+
+`fixed` and `adaptive` are explicit per-worker inventory fields:
+
+- `fixed`: begins at `initial_concurrency`, stays there after clean runs and
+  ordinary failures, and only steps down one level for a classified
+  `terminal_resource_insufficient` or `rate_limited` result. It never probes
+  upward automatically.
+- `adaptive`: begins at `initial_concurrency` and uses Hub's resource-backed
+  probe loop to raise or lower controller `desired_concurrency`, always bounded
+  by `max_concurrency`.
+
+The Runner also clamps every Hub instruction to its own hard maximum. An invalid
+initial value fails registration instead of being silently altered.
+
+## Token And Startup Contract
+
+The stable environment-variable names are `LOOM_HUB_TOKEN` and
+`LOOM_RUNNER_TOKEN`, overridable only through the documented `--*-token-env`
+options. Matrix forwards configured token values to remote Hub/Runners through
+temporary mode-`0600` environment files and registers only the Direct Runner
+token variable name with Hub.
+
+Hub refuses a non-loopback bind without its token. A Direct Runner refuses a
+non-loopback control bind without its separate token. The Runner registration
+handshake includes `runner_api_version`; Hub rejects an incompatible Runner
+before it can claim work.
+
+See [Loom Manifest](TASK_MANIFEST.md), [Architecture](ARCHITECTURE.md), and
+[Release Contract](RELEASE_CONTRACT.md) for behavior beyond the v1 compatibility
+surface.

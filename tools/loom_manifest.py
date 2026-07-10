@@ -16,9 +16,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from loom_contract import CORE_PREVIEW_VERSION, MANIFEST_SCHEMA_VERSION
 
 SAFE_ID = re.compile(r"[^A-Za-z0-9_.-]+")
 FINAL_STATES = {"clean", "dirty", "run_error", "needs_review", "accepted", "ignored", "blocked", "cancelled"}
+PHASE_FIELDS = {
+    "name",
+    "command",
+    "args",
+    "cwd",
+    "env",
+    "timeout_seconds",
+    "continue_on_error",
+    "artifact_paths",
+}
 
 
 def read_json_or_jsonl(path: Path) -> Any:
@@ -52,6 +63,91 @@ def expand_template(value: Any, context: dict[str, Any]) -> Any:
     if isinstance(value, dict):
         return {key: expand_template(item, context) for key, item in value.items()}
     return value
+
+
+def string_list(value: Any, *, field: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list) or any(not isinstance(item, (str, int, float)) for item in value):
+        raise ValueError(f"{field} must be a string or a list of scalar values")
+    return [str(item) for item in value]
+
+
+def phase_rows(value: Any, *, field: str, allow_partial: bool) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field} must be a non-empty list of phase objects")
+    rows: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for index, raw in enumerate(value, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"{field}[{index}] must be an object")
+        unknown = sorted(set(raw) - PHASE_FIELDS)
+        if unknown:
+            raise ValueError(f"{field}[{index}] has unsupported fields: {', '.join(unknown)}")
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"{field}[{index}].name is required")
+        if name in names:
+            raise ValueError(f"{field} contains duplicate phase name: {name}")
+        names.add(name)
+        if not allow_partial and not raw.get("command"):
+            raise ValueError(f"{field}[{index}].command is required")
+        if "args" in raw:
+            string_list(raw["args"], field=f"{field}[{index}].args")
+        if "artifact_paths" in raw:
+            string_list(raw["artifact_paths"], field=f"{field}[{index}].artifact_paths")
+        if "env" in raw and not isinstance(raw["env"], dict):
+            raise ValueError(f"{field}[{index}].env must be an object")
+        if "timeout_seconds" in raw and int(raw["timeout_seconds"]) <= 0:
+            raise ValueError(f"{field}[{index}].timeout_seconds must be positive")
+        rows.append(dict(raw))
+    return rows
+
+
+def phase_specs(defaults: dict[str, Any], case: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
+    """Merge named case phase overrides while preserving default declaration order."""
+    default_rows = phase_rows(defaults.get("phases"), field="defaults.phases", allow_partial=False)
+    case_rows = phase_rows(case.get("phases"), field="case.phases", allow_partial=True)
+    if not default_rows and not case_rows:
+        return []
+    merged = [dict(row) for row in default_rows]
+    positions = {str(row["name"]): index for index, row in enumerate(merged)}
+    for row in case_rows:
+        name = str(row["name"])
+        if name not in positions:
+            if not row.get("command"):
+                raise ValueError(f"case.phases override for new phase {name!r} requires command")
+            positions[name] = len(merged)
+            merged.append(dict(row))
+            continue
+        index = positions[name]
+        base = merged[index]
+        overlay = dict(row)
+        env = merge_dicts(
+            base.get("env") if isinstance(base.get("env"), dict) else None,
+            overlay.get("env") if isinstance(overlay.get("env"), dict) else None,
+        )
+        base.update(overlay)
+        if env:
+            base["env"] = env
+        elif "env" in base:
+            base.pop("env", None)
+        merged[index] = base
+    resolved: list[dict[str, Any]] = []
+    for index, phase in enumerate(merged, start=1):
+        if not phase.get("command"):
+            raise ValueError(f"phase {phase.get('name')!r} has no command after merge")
+        phase = expand_template(phase, context)
+        phase["phase"] = str(phase["name"])
+        phase["phase_index"] = index
+        phase["args"] = string_list(phase.get("args"), field=f"phase {phase['name']}.args")
+        phase["artifact_paths"] = string_list(phase.get("artifact_paths"), field=f"phase {phase['name']}.artifact_paths")
+        resolved.append(phase)
+    return resolved
 
 
 def command_specs(raw: Any, context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -88,16 +184,35 @@ def expected_contract(defaults: dict[str, Any], case: dict[str, Any], context: d
     return expected
 
 
-def normalize(data: Any, *, operator: str) -> dict[str, Any]:
+def normalize(
+    data: Any,
+    *,
+    operator: str,
+    case_ids: set[str] | None = None,
+    run_ids: set[str] | None = None,
+    setting_ids: set[str] | None = None,
+) -> dict[str, Any]:
     if isinstance(data, list):
         campaign_ids = {slug(item.get("campaign_id")) for item in data if isinstance(item, dict) and item.get("campaign_id")}
+        versions = {item.get("schema_version") for item in data if isinstance(item, dict)}
         if len(campaign_ids) != 1 or any(not isinstance(item, dict) or not item.get("campaign_id") for item in data):
             raise ValueError("JSONL rows require one shared explicit campaign_id")
-        campaign = {"campaign_id": next(iter(campaign_ids)), "cases": data}
+        if len(versions) != 1 or None in versions:
+            raise ValueError("JSONL rows require one shared explicit schema_version")
+        campaign = {"schema_version": next(iter(versions)), "campaign_id": next(iter(campaign_ids)), "cases": data}
     else:
         campaign = dict(data)
     if not campaign.get("campaign_id"):
         raise ValueError("manifest requires explicit campaign_id")
+    if "schema_version" not in campaign:
+        raise ValueError("manifest requires explicit schema_version")
+    raw_schema_version = campaign["schema_version"]
+    try:
+        schema_version = int(raw_schema_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("manifest schema_version must be an integer") from exc
+    if schema_version != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"unsupported manifest schema_version: {schema_version}")
     campaign_id = slug(campaign["campaign_id"])
     defaults = campaign.get("defaults") or {}
     source = campaign.get("source") or defaults.get("source")
@@ -111,6 +226,12 @@ def normalize(data: Any, *, operator: str) -> dict[str, Any]:
         case_id = slug(case.get("case_id") or defaults.get("case_id"))
         run_id = slug(case.get("run_id") or defaults.get("run_id"))
         setting_id = slug(case.get("setting_id") or defaults.get("setting_id"))
+        if case_ids and case_id not in case_ids:
+            continue
+        if run_ids and run_id not in run_ids:
+            continue
+        if setting_ids and setting_id not in setting_ids:
+            continue
         context = {**defaults, **case, "campaign_id": campaign_id, "case_id": case_id, "run_id": run_id, "setting_id": setting_id}
         task_id = slug(case.get("task_id") or f"{campaign_id}__{case_id}__{setting_id}__run-{run_id}")
         if task_id in task_ids:
@@ -118,10 +239,14 @@ def normalize(data: Any, *, operator: str) -> dict[str, Any]:
         task_ids.add(task_id)
         payload = merge_dicts(defaults.get("payload"), case.get("payload"))
         runner = str(case.get("runner") or payload.get("runner") or defaults.get("runner") or "repo")
+        artifact_paths = string_list(
+            case.get("artifact_paths") or case.get("artifacts") or defaults.get("artifact_paths"),
+            field="artifact_paths",
+        )
         payload.update(
             {
                 "runner": runner,
-                "artifact_paths": expand_template(case.get("artifact_paths") or case.get("artifacts") or defaults.get("artifact_paths") or [], context),
+                "artifact_paths": expand_template(artifact_paths, context),
                 "env": merge_dicts(defaults.get("env"), case.get("env")),
                 "timeout_seconds": int(case.get("timeout_seconds") or defaults.get("timeout_seconds") or 300),
                 "continue_on_error": bool(case.get("continue_on_error", defaults.get("continue_on_error", False))),
@@ -155,7 +280,16 @@ def normalize(data: Any, *, operator: str) -> dict[str, Any]:
             if not task_source:
                 raise ValueError(f"repo run row {index} requires source")
             payload["source"] = expand_template(task_source, context)
-            payload["commands"] = command_specs(case.get("commands") or defaults.get("commands"), context)
+            phases = phase_specs(defaults, case, context)
+            if phases:
+                payload["phases"] = phases
+                payload["commands"] = [dict(phase) for phase in phases]
+                for phase in phases:
+                    for pattern in phase.get("artifact_paths") or []:
+                        if pattern not in payload["artifact_paths"]:
+                            payload["artifact_paths"].append(pattern)
+            else:
+                payload["commands"] = command_specs(case.get("commands") or defaults.get("commands"), context)
         elif runner == "shell":
             command = case.get("command") or defaults.get("command") or payload.get("command")
             if not command:
@@ -182,8 +316,10 @@ def normalize(data: Any, *, operator: str) -> dict[str, Any]:
             task["expected"] = expected
         tasks.append(task)
     if not tasks:
-        raise ValueError("manifest produced no tasks")
+        selection = " for requested case/run/setting selection" if case_ids or run_ids or setting_ids else ""
+        raise ValueError(f"manifest produced no tasks{selection}")
     return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "operator": operator,
         "campaign_id": campaign_id,
         "package_id": slug(campaign.get("package_id") or campaign_id),
@@ -193,15 +329,25 @@ def normalize(data: Any, *, operator: str) -> dict[str, Any]:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Normalize benchmark task input for controller dispatch.")
+    parser.add_argument("--version", action="version", version=f"Loom Manifest Core Preview {CORE_PREVIEW_VERSION} (manifest v{MANIFEST_SCHEMA_VERSION})")
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--operator", default="manifest-normalizer")
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--case-id", action="append", default=[], help="Normalize only these case IDs. Repeat to select more than one.")
+    parser.add_argument("--run-id", action="append", default=[], help="Normalize only these run IDs. Repeat to select more than one.")
+    parser.add_argument("--setting-id", action="append", default=[], help="Normalize only these setting IDs. Repeat to select more than one.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    payload = normalize(read_json_or_jsonl(args.manifest), operator=args.operator)
+    payload = normalize(
+        read_json_or_jsonl(args.manifest),
+        operator=args.operator,
+        case_ids={slug(value) for value in args.case_id} or None,
+        run_ids={slug(value) for value in args.run_id} or None,
+        setting_ids={slug(value) for value in args.setting_id} or None,
+    )
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

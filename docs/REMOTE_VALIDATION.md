@@ -3,6 +3,57 @@
 Use Loom Matrix for remote validation. Do not use GitHub Actions for evaluation
 tests.
 
+## Fixed AgentDojo Release Smoke
+
+Every Core Preview release uses the fixed two-case, two-run, two-attempt
+AgentDojo check described in [AgentDojo Release Fixture](AGENTDOJO_EXAMPLE.md).
+It runs on one fresh, already-provisioned remote host because the broader
+multi-shape fleet path has a separate validation history.
+
+The fixture has four task identities and eight retained result packages:
+
+```text
+2 cases x 2 runs x 2 attempts = 8 result ZIPs
+```
+
+Attempt 1 is an intentional retryable preflight failure. Attempt 2 performs the
+real minimal AgentDojo invocation. This tests independently schedulable
+`case_id`, `run_id`, and `attempt_no` without turning the release gate into
+eight paid model calls.
+
+On the remote host only, make the fixture's upstream execution environment and
+ephemeral Loom bearer tokens available in its process environment, then run:
+
+```bash
+export LOOM_HUB_TOKEN="$(openssl rand -hex 32)"
+export LOOM_RUNNER_TOKEN="$(openssl rand -hex 32)"
+export LOCAL_LLM_PORT=18000
+
+python3 tools/loom_agentdojo_remote_smoke.py \
+  --repo-root "$PWD" \
+  --source-path /srv/cache/agentdojo-v0.1.35 \
+  --runtime-dir /tmp/loom-agentdojo-eight-slot \
+  --export-dir /tmp/loom-agentdojo-eight-slot/recovered
+```
+
+The optional `--source-path` is a remote checkout verified against the
+fixture's pinned tag before the temporary manifest uses it. It prevents eight
+identical network clones while preserving a separately copied workspace for
+every attempt.
+
+The helper runs the remote unit suite, starts an authenticated loopback-only Hub
+and Direct Runner in `push` mode, validates all eight downloads and SHA-256
+values, writes a redacted recovery export, and stops those two processes in a
+`finally` path. It does not stop or delete the VM. After copying only the
+redacted recovery export and the summary you need, the operator must explicitly
+stop/delete the temporary instance and confirm it is no longer billable.
+
+The committed fixture uses AgentDojo's `LOCAL` channel so a remote
+OpenAI-compatible test endpoint must be available at `LOCAL_LLM_PORT`. A real
+provider run is an operator choice: override `--model` and pass each required
+provider environment variable through `--require-env NAME`. Neither choice
+changes Loom's Core Preview contract.
+
 ## Support Boundary
 
 This project supports validation on existing, operator-supplied hosts. The
@@ -53,8 +104,10 @@ Each worker may choose a connection mode:
 - `long-poll`: like `ssh-start`, but the worker holds empty claim requests open
   to reduce request churn and keep a steadier controller connection.
 - `direct-worker-api`: SSH starts a worker-side HTTP endpoint on
-  `command_port`. The matrix runner calls that endpoint to start the worker loop.
-  Task state, leases, and concurrency remain controller-owned.
+  `command_port`. Set `direct_api_dispatch_mode` to `pull` to start/continue the
+  worker loop, or `push` to leave the loop idle and let Hub actively deliver an
+  exact lease to `/api/tasks/execute`. Task state, leases, and concurrency remain
+  controller-owned in both modes.
 
 Set `connection_defaults.ssh_control_persist` to reuse SSH control connections
 during deployment. This avoids a cold SSH handshake for every setup command.
@@ -102,17 +155,20 @@ python3 tools/loom_matrix.py \
 create, resize, or destroy CVMs. That inventory-driven boundary is the supported
 contract.
 
-Use `--forward-env SOURCE_REPO_TOKEN` for private source repositories. The value
-is copied to a temporary 0600 env file on each worker and is not stored in the
-inventory.
+Set `LOOM_HUB_TOKEN` before a non-loopback Matrix Hub startup. For a Direct
+Runner, also set `LOOM_RUNNER_TOKEN` (or choose explicit environment-variable
+names in the inventory). Matrix forwards those values through temporary `0600`
+environment files and records only names, never their values, in inventory.
+Use `--forward-env SOURCE_REPO_TOKEN` for private source repositories.
 
 ## Autonomous Five-Host Validation
 
 Generate two repo-independent input campaigns: one with enough CPU-bound work
 to prove every concurrency batch through theoretical maximum plus 10, and one
-with six known failure classes plus a cross-worker retry probe. The
-[AgentDojo Example](AGENTDOJO_EXAMPLE.md) is documentation only; it is not a
-remote validation phase and is deliberately excluded from this matrix.
+with six known failure classes plus a cross-worker retry probe. The fixed
+[AgentDojo release fixture](AGENTDOJO_EXAMPLE.md) is intentionally separate: it
+is the small per-release gate, while this larger matrix remains the broad fleet
+validation path.
 
 ```bash
 RUN_DIR=.cloud-runs/loom-matrix-$(date +%Y%m%d%H%M%S)

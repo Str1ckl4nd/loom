@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "campaign_id": "agentdojo-eight-slot-release",
+  "source": {
+    "type": "git",
+    "url": "https://github.com/ethz-spylab/agentdojo.git",
+    "ref": "v0.1.35",
+    "depth": 1
+  },
+  "defaults": {
+    "runner": "repo",
+    "required_capability": "agentdojo-openai",
+    "agentdojo_model": "LOCAL",
+    "agentdojo_model_id": "loom-release-stub",
+    "timeout_seconds": 1800,
+    "retry_policy": {
+      "max_attempts": 2,
+      "retry_categories": ["network_unavailable"],
+      "different_worker": false
+    },
+    "expected": {
+      "state": "clean",
+      "attempt_no": 2,
+      "min_result_count": 2
+    },
+    "artifact_paths": [
+      "agentdojo-artifact-index.json",
+      "loom-agentdojo-output/**"
+    ],
+    "phases": [
+      {
+        "name": "prepare",
+        "command": [
+          "sh",
+          "-lc",
+          "if [ \"${LOOM_ATTEMPT_NO:-1}\" = \"1\" ]; then printf '%s\\n' 'connection timed out: Loom intentional attempt-1 retry probe' >&2; exit 1; fi; python3 -m pip install --disable-pip-version-check --no-input ."
+        ],
+        "timeout_seconds": 900
+      },
+      {
+        "name": "evaluate",
+        "command": [
+          "python3",
+          "-m",
+          "agentdojo.scripts.benchmark"
+        ],
+        "args": [
+          "--suite",
+          "{agentdojo_suite}",
+          "--user-task",
+          "{agentdojo_user_task}",
+          "--model",
+          "{agentdojo_model}",
+          "--model-id",
+          "{agentdojo_model_id}",
+          "--logdir",
+          "loom-agentdojo-output/{case_id}/{run_id}"
+        ],
+        "timeout_seconds": 1800
+      },
+      {
+        "name": "collect",
+        "command": [
+          "python3",
+          "-c",
+          "import hashlib,json,os; from pathlib import Path; root=Path('loom-agentdojo-output'); files=[{'path':p.relative_to(root).as_posix(),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted(root.rglob('*')) if p.is_file()]; Path('agentdojo-artifact-index.json').write_text(json.dumps({'case_id':os.environ['LOOM_CASE_ID'],'run_id':os.environ['LOOM_RUN_ID'],'attempt_no':int(os.environ['LOOM_ATTEMPT_NO']),'files':files},indent=2)+'\\n',encoding='utf-8')"
+        ],
+        "artifact_paths": [
+          "agentdojo-artifact-index.json",
+          "loom-agentdojo-output/**"
+        ],
+        "timeout_seconds": 120
+      }
+    ]
+  },
+  "cases": [
+    {
+      "case_id": "workspace-user-task-0",
+      "setting_id": "no-defense",
+      "run_id": "001",
+      "agentdojo_suite": "workspace",
+      "agentdojo_user_task": "user_task_0"
+    },
+    {
+      "case_id": "workspace-user-task-0",
+      "setting_id": "no-defense",
+      "run_id": "002",
+      "agentdojo_suite": "workspace",
+      "agentdojo_user_task": "user_task_0"
+    },
+    {
+      "case_id": "workspace-user-task-1",
+      "setting_id": "no-defense",
+      "run_id": "001",
+      "agentdojo_suite": "workspace",
+      "agentdojo_user_task": "user_task_1"
+    },
+    {
+      "case_id": "workspace-user-task-1",
+      "setting_id": "no-defense",
+      "run_id": "002",
+      "agentdojo_suite": "workspace",
+      "agentdojo_user_task": "user_task_1"
+    }
+  ]
+}

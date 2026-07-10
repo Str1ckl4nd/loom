@@ -25,7 +25,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
+
+from loom_contract import (
+    CONCURRENCY_POLICIES,
+    CORE_PREVIEW_VERSION,
+    DISPATCH_SCHEMA_VERSION,
+    FIXED_CONCURRENCY_BACKOFF_ISSUES,
+    HUB_API_VERSION,
+    INVENTORY_SCHEMA_VERSION,
+    metadata,
+    RUNNER_API_VERSION,
+)
+from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, is_loopback_host, request_json as http_request_json, token_from_env, token_matches
 
 
 CASE_ROW = re.compile(r"^\|\s*(C\d+)\s*\|\s*`?([^`|]+)`?\s*\|\s*`?([^`|]+)`?\s*\|\s*`?([^`|]+)`?\s*\|")
@@ -129,6 +140,10 @@ def host_endpoint(host: dict[str, Any]) -> dict[str, Any]:
     endpoint = dict(host.get("endpoint") or connection.get("endpoint") or {})
     if host.get("worker_url"):
         endpoint["worker_url"] = host["worker_url"]
+    if host.get("direct_api_token_env"):
+        endpoint["direct_api_token_env"] = host["direct_api_token_env"]
+    if host.get("runner_token_env"):
+        endpoint["direct_api_token_env"] = host["runner_token_env"]
     if host.get("host"):
         endpoint.setdefault("host", host["host"])
     if host.get("port"):
@@ -163,26 +178,36 @@ def register_host_rows(conn: sqlite3.Connection, hosts: list[dict[str, Any]], op
         mode = connection_mode(host)
         capabilities = host.get("capabilities") or []
         max_concurrency = max(1, safe_int(host.get("max_concurrency") or host.get("cpu"), 1))
+        initial_concurrency = safe_int(host.get("initial_concurrency"), 1)
+        if initial_concurrency < 1 or initial_concurrency > max_concurrency:
+            raise ValueError(f"host {host_id} requires 1 <= initial_concurrency <= max_concurrency")
+        concurrency_policy = str(host.get("concurrency_policy") or "fixed").strip().lower()
+        if concurrency_policy not in CONCURRENCY_POLICIES:
+            raise ValueError(f"host {host_id} has unsupported concurrency_policy: {concurrency_policy}")
         endpoint = host_endpoint(host)
         ssh_config = host_ssh_config(host)
         labels = dict(host.get("labels") or {})
         for key in ("instance_type", "cpu", "memory_gb"):
             if host.get(key) is not None:
                 labels.setdefault(key, host[key])
+        labels.setdefault("initial_concurrency", initial_concurrency)
+        labels.setdefault("concurrency_policy", concurrency_policy)
         conn.execute(
             """
             INSERT INTO worker_hosts(
               host_id, worker_id, connection_mode, state, capabilities_json,
-              max_concurrency, endpoint_json, ssh_json, labels_json,
+              max_concurrency, initial_concurrency, concurrency_policy, endpoint_json, ssh_json, labels_json,
               registered_by, created_at, last_seen_at, updated_at
             )
-            VALUES (?, ?, ?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
               worker_id=excluded.worker_id,
               connection_mode=excluded.connection_mode,
               state='registered',
               capabilities_json=excluded.capabilities_json,
               max_concurrency=excluded.max_concurrency,
+              initial_concurrency=excluded.initial_concurrency,
+              concurrency_policy=excluded.concurrency_policy,
               endpoint_json=excluded.endpoint_json,
               ssh_json=excluded.ssh_json,
               labels_json=excluded.labels_json,
@@ -196,6 +221,8 @@ def register_host_rows(conn: sqlite3.Connection, hosts: list[dict[str, Any]], op
                 mode,
                 json.dumps(capabilities, ensure_ascii=False),
                 max_concurrency,
+                initial_concurrency,
+                concurrency_policy,
                 json.dumps(endpoint, ensure_ascii=False),
                 json.dumps(ssh_config, ensure_ascii=False),
                 json.dumps(labels, ensure_ascii=False),
@@ -211,6 +238,8 @@ def register_host_rows(conn: sqlite3.Connection, hosts: list[dict[str, Any]], op
                 "worker_id": worker_id,
                 "connection_mode": mode,
                 "max_concurrency": max_concurrency,
+                "initial_concurrency": initial_concurrency,
+                "concurrency_policy": concurrency_policy,
                 "capabilities": capabilities,
                 "endpoint": endpoint,
             }
@@ -281,6 +310,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           status TEXT NOT NULL DEFAULT 'registered',
           capabilities_json TEXT NOT NULL DEFAULT '[]',
           max_concurrency INTEGER NOT NULL DEFAULT 1,
+          initial_concurrency INTEGER NOT NULL DEFAULT 1,
+          concurrency_policy TEXT NOT NULL DEFAULT 'fixed',
           blocked INTEGER NOT NULL DEFAULT 0,
           active_runs_json TEXT NOT NULL DEFAULT '[]',
           health_json TEXT NOT NULL DEFAULT '{}',
@@ -345,6 +376,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           state TEXT NOT NULL DEFAULT 'registered',
           capabilities_json TEXT NOT NULL DEFAULT '[]',
           max_concurrency INTEGER NOT NULL DEFAULT 1,
+          initial_concurrency INTEGER NOT NULL DEFAULT 1,
+          concurrency_policy TEXT NOT NULL DEFAULT 'fixed',
           endpoint_json TEXT NOT NULL DEFAULT '{}',
           ssh_json TEXT NOT NULL DEFAULT '{}',
           labels_json TEXT NOT NULL DEFAULT '{}',
@@ -398,6 +431,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "workers", "resource_json", "TEXT NOT NULL DEFAULT '{}'")
     ensure_column(conn, "workers", "tuning_json", "TEXT NOT NULL DEFAULT '{}'")
     ensure_column(conn, "workers", "desired_concurrency", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "workers", "initial_concurrency", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "workers", "concurrency_policy", "TEXT NOT NULL DEFAULT 'fixed'")
+    ensure_column(conn, "worker_hosts", "initial_concurrency", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "worker_hosts", "concurrency_policy", "TEXT NOT NULL DEFAULT 'fixed'")
     ensure_column(conn, "tasks", "run_id", "TEXT")
     ensure_column(conn, "tasks", "setting_id", "TEXT")
     ensure_column(conn, "tasks", "excluded_worker_ids_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -722,14 +759,71 @@ def update_worker_concurrency_from_result(
     tuning = json.loads(worker["tuning_json"] or "{}")
     worker_result = summary.get("worker_result") or {}
     max_concurrency = max(1, safe_int(worker["max_concurrency"], 1))
-    current_desired = max(1, safe_int(worker["desired_concurrency"], 1))
+    initial_concurrency = max(1, min(safe_int(worker["initial_concurrency"], 1), max_concurrency))
+    concurrency_policy = str(worker["concurrency_policy"] or "fixed").strip().lower()
+    if concurrency_policy not in CONCURRENCY_POLICIES:
+        concurrency_policy = "fixed"
+    current_desired = max(1, min(safe_int(worker["desired_concurrency"], initial_concurrency), max_concurrency))
     reported_estimate = theoretical_concurrency(resource, worker_result)
     concurrency = worker_result.get("controller_concurrency") or {}
-    observed = max(1, safe_int(concurrency.get("desired_concurrency"), current_desired))
+    observed = max(1, min(safe_int(concurrency.get("desired_concurrency"), current_desired), max_concurrency))
     batch_id = str(concurrency.get("claim_batch_id") or f"legacy-{task_id}")
     batch_size = max(1, safe_int(concurrency.get("claim_batch_size"), 1))
     issues = summary.get("issues") or []
     healthy = verdict == "clean" and not issues
+    if concurrency_policy == "fixed":
+        backoff_issues = sorted(set(str(issue) for issue in issues) & FIXED_CONCURRENCY_BACKOFF_ISSUES)
+        desired = current_desired
+        mode = "fixed_stable"
+        if not healthy and backoff_issues:
+            desired = max(1, current_desired - 1)
+            mode = "fixed_backoff_" + "_".join(backoff_issues)
+        tuning.update(
+            {
+                "updated_at": utc_now(),
+                "concurrency_policy": "fixed",
+                "initial_concurrency": initial_concurrency,
+                "current_concurrency": desired,
+                "last_mode": mode,
+                "last_verdict": verdict,
+                "last_reported_estimate": reported_estimate,
+                "last_observed_concurrency": observed,
+                "last_fixed_backoff_issues": backoff_issues,
+            }
+        )
+        if not healthy:
+            for issue in issues or ["run_error"]:
+                log_control(
+                    conn,
+                    server,
+                    "warning",
+                    str(issue),
+                    f"worker {worker_id} task {task_id} reported {issue}; fixed concurrency remains {desired}",
+                    worker_id=worker_id,
+                    task_id=task_id,
+                    payload={
+                        "concurrency_policy": "fixed",
+                        "initial_concurrency": initial_concurrency,
+                        "desired_concurrency": desired,
+                        "backoff_issues": backoff_issues,
+                    },
+                )
+        if backoff_issues:
+            log_control(
+                conn,
+                server,
+                "warning",
+                "fixed_concurrency_backoff",
+                f"worker {worker_id} reduced fixed concurrency from {current_desired} to {desired}",
+                worker_id=worker_id,
+                task_id=task_id,
+                payload={"issues": backoff_issues, "initial_concurrency": initial_concurrency},
+            )
+        conn.execute(
+            "UPDATE workers SET desired_concurrency=?, tuning_json=?, updated_at=? WHERE worker_id=?",
+            (desired, json.dumps(tuning, ensure_ascii=False), utc_now(), worker_id),
+        )
+        return
     baseline_created = False
     if healthy and observed == 1 and not isinstance(tuning.get("baseline_estimate"), dict):
         tuning["baseline_estimate"] = reported_estimate
@@ -850,6 +944,8 @@ def update_worker_concurrency_from_result(
     tuning.update(
         {
             "updated_at": utc_now(),
+            "concurrency_policy": "adaptive",
+            "initial_concurrency": initial_concurrency,
             "current_concurrency": desired,
             "last_mode": mode,
             "last_verdict": verdict,
@@ -884,6 +980,8 @@ def score_result_zip(path: Path) -> tuple[str, dict[str, Any]]:
                     continue
             worker_result_names = [n for n in names if n.endswith("worker-result.json")]
             artifact_summary_names = [n for n in names if n.endswith("artifact-summary.json")]
+            artifact_manifest_names = [n for n in names if n.endswith("artifact-manifest.json")]
+            phase_result_names = [n for n in names if n.endswith("phase-results.json")]
             scheduler_names = [n for n in names if n.endswith("case-scheduler-summary.json")]
             score_names = [n for n in names if n.endswith("score-summary.json")]
             scored = False
@@ -897,6 +995,10 @@ def score_result_zip(path: Path) -> tuple[str, dict[str, Any]]:
                 scored = True
             if artifact_summary_names:
                 summary["artifact_summary"] = json.loads(z.read(sorted(artifact_summary_names)[0]).decode("utf-8-sig"))
+            if artifact_manifest_names:
+                summary["artifact_manifest"] = json.loads(z.read(sorted(artifact_manifest_names)[0]).decode("utf-8-sig"))
+            if phase_result_names:
+                summary["phase_results"] = json.loads(z.read(sorted(phase_result_names)[0]).decode("utf-8-sig"))
             if not scored and scheduler_names:
                 data = json.loads(z.read(sorted(scheduler_names)[0]).decode("utf-8-sig"))
                 summary["case_scheduler_summary"] = data
@@ -946,6 +1048,8 @@ class ControllerServer(ThreadingHTTPServer):
     artifact_root: Path
     control_log_path: Path | None
     upload_lock: threading.Lock
+    auth_token: str | None
+    runner_token_env: str
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -980,16 +1084,43 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8-sig"))
 
+    def _require_auth(self) -> bool:
+        if token_matches(self.headers, getattr(self.server, "auth_token", None)):
+            return True
+        self._json(401, {"error": "unauthorized"})
+        return False
+
     def _db(self) -> sqlite3.Connection:
         return connect(self.server.db_path)
 
     def do_GET(self) -> None:
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         qs = parse_qs(parsed.query)
         try:
             if path == "/api/healthz":
-                self._json(200, {"ok": True, "time": utc_now()})
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "time": utc_now(),
+                        "core_preview_version": CORE_PREVIEW_VERSION,
+                        "hub_api_version": HUB_API_VERSION,
+                        "capabilities": metadata("hub")["capabilities"],
+                    },
+                )
+                return
+            if path == "/api/meta":
+                self._json(
+                    200,
+                    {
+                        **metadata("hub"),
+                        "auth_required": bool(getattr(self.server, "auth_token", None)),
+                        "runner_token_env": self.server.runner_token_env,
+                    },
+                )
                 return
             if path == "/api/catalog/tasks":
                 cases = load_registry_cases(self.server.benchmark_root)
@@ -1188,6 +1319,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": type(exc).__name__, "detail": str(exc)})
 
     def do_POST(self) -> None:
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
@@ -1242,6 +1375,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/set-worker-concurrency":
                 self._set_worker_concurrency()
                 return
+            if path == "/api/admin/push-task":
+                self._push_task()
+                return
             if path == "/api/admin/register-worker-hosts":
                 self._register_worker_hosts()
                 return
@@ -1251,6 +1387,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch_tasks(self) -> None:
         payload = self._read_json()
+        try:
+            schema_version = int(payload.get("schema_version"))
+        except (TypeError, ValueError):
+            self._json(400, {"error": "dispatch_requires_schema_version", "expected": DISPATCH_SCHEMA_VERSION})
+            return
+        if schema_version != DISPATCH_SCHEMA_VERSION:
+            self._json(
+                400,
+                {
+                    "error": "unsupported_dispatch_schema_version",
+                    "expected": DISPATCH_SCHEMA_VERSION,
+                    "received": schema_version,
+                },
+            )
+            return
         cases = {c["case_id"]: c for c in load_registry_cases(self.server.benchmark_root)}
         task_specs = payload.get("tasks")
         if task_specs is None:
@@ -1346,40 +1497,73 @@ class Handler(BaseHTTPRequestHandler):
 
     def _register_worker(self) -> None:
         payload = self._read_json()
+        try:
+            runner_api_version = int(payload.get("runner_api_version"))
+        except (TypeError, ValueError):
+            self._json(400, {"error": "runner_api_version_required", "expected": RUNNER_API_VERSION})
+            return
+        if runner_api_version != RUNNER_API_VERSION:
+            self._json(400, {"error": "unsupported_runner_api_version", "expected": RUNNER_API_VERSION, "received": runner_api_version})
+            return
         worker_id = str(payload.get("worker_id") or "worker-" + str(uuid.uuid4()))
         capabilities = payload.get("capabilities") or []
-        max_concurrency = max(1, int(payload.get("max_concurrency") or 1))
-        desired_concurrency = max(1, min(int(payload.get("initial_concurrency") or 1), max_concurrency))
+        try:
+            max_concurrency = int(payload.get("max_concurrency") or 1)
+            initial_concurrency = int(payload.get("initial_concurrency") or 1)
+        except (TypeError, ValueError):
+            self._json(400, {"error": "concurrency_values_must_be_integers"})
+            return
+        if max_concurrency < 1 or initial_concurrency < 1 or initial_concurrency > max_concurrency:
+            self._json(400, {"error": "initial_concurrency_must_be_between_one_and_max_concurrency"})
+            return
+        concurrency_policy = str(payload.get("concurrency_policy") or "fixed").strip().lower()
+        if concurrency_policy not in CONCURRENCY_POLICIES:
+            self._json(400, {"error": "unsupported_concurrency_policy", "allowed": sorted(CONCURRENCY_POLICIES)})
+            return
+        desired_concurrency = initial_concurrency
         now = utc_now()
         with self._db() as conn:
             conn.execute(
                 """
                 INSERT INTO workers(
-                  worker_id, status, capabilities_json, max_concurrency, desired_concurrency,
+                  worker_id, status, capabilities_json, max_concurrency, initial_concurrency, concurrency_policy, desired_concurrency,
                   registered_at, last_seen_at, updated_at, health_json, resource_json, tuning_json
                 )
-                VALUES (?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(worker_id) DO UPDATE SET
                   status='registered',
                   capabilities_json=excluded.capabilities_json,
                   max_concurrency=excluded.max_concurrency,
-                  desired_concurrency=MIN(workers.desired_concurrency, excluded.max_concurrency),
+                  initial_concurrency=excluded.initial_concurrency,
+                  concurrency_policy=excluded.concurrency_policy,
+                  desired_concurrency=excluded.initial_concurrency,
                   last_seen_at=excluded.last_seen_at,
                   updated_at=excluded.updated_at,
                   health_json=excluded.health_json,
-                  resource_json=excluded.resource_json
+                  resource_json=excluded.resource_json,
+                  tuning_json=excluded.tuning_json
                 """,
                 (
                     worker_id,
                     json.dumps(capabilities, ensure_ascii=False),
                     max_concurrency,
+                    initial_concurrency,
+                    concurrency_policy,
                     desired_concurrency,
                     now,
                     now,
                     now,
                     json.dumps(payload.get("health") or {}, ensure_ascii=False),
                     json.dumps((payload.get("health") or {}).get("resources") or {}, ensure_ascii=False),
-                    json.dumps({"current_concurrency": desired_concurrency, "updated_at": now}, ensure_ascii=False),
+                    json.dumps(
+                        {
+                            "concurrency_policy": concurrency_policy,
+                            "initial_concurrency": initial_concurrency,
+                            "current_concurrency": desired_concurrency,
+                            "updated_at": now,
+                        },
+                        ensure_ascii=False,
+                    ),
                 ),
             )
             log_worker_event(conn, worker_id, "registered", payload)
@@ -1388,12 +1572,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.server,
                 "info",
                 "worker_registered",
-                f"worker {worker_id} registered with max_concurrency={max_concurrency}",
+                f"worker {worker_id} registered with initial={initial_concurrency}, max={max_concurrency}, policy={concurrency_policy}",
                 worker_id=worker_id,
-                payload={"capabilities": capabilities, "desired_concurrency": desired_concurrency},
+                payload={
+                    "capabilities": capabilities,
+                    "initial_concurrency": initial_concurrency,
+                    "desired_concurrency": desired_concurrency,
+                    "max_concurrency": max_concurrency,
+                    "concurrency_policy": concurrency_policy,
+                },
             )
             conn.commit()
-        self._json(200, {"ok": True, "worker_id": worker_id, "desired_concurrency": desired_concurrency, "max_concurrency": max_concurrency})
+        self._json(
+            200,
+            {
+                "ok": True,
+                "worker_id": worker_id,
+                "initial_concurrency": initial_concurrency,
+                "desired_concurrency": desired_concurrency,
+                "max_concurrency": max_concurrency,
+                "concurrency_policy": concurrency_policy,
+            },
+        )
 
     def _heartbeat(self) -> None:
         payload = self._read_json()
@@ -1419,7 +1619,10 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
             log_worker_event(conn, worker_id, "heartbeat", payload)
-            worker = conn.execute("SELECT desired_concurrency,max_concurrency FROM workers WHERE worker_id=?", (worker_id,)).fetchone()
+            worker = conn.execute(
+                "SELECT initial_concurrency,concurrency_policy,desired_concurrency,max_concurrency FROM workers WHERE worker_id=?",
+                (worker_id,),
+            ).fetchone()
             conn.commit()
         self._json(
             200,
@@ -1427,8 +1630,10 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "worker_id": worker_id,
                 "time": now,
+                "initial_concurrency": int(worker["initial_concurrency"] or 1) if worker else 1,
                 "desired_concurrency": int(worker["desired_concurrency"] or 1) if worker else 1,
                 "max_concurrency": int(worker["max_concurrency"] or 1) if worker else 1,
+                "concurrency_policy": str(worker["concurrency_policy"] or "fixed") if worker else "fixed",
             },
         )
 
@@ -1449,8 +1654,10 @@ class Handler(BaseHTTPRequestHandler):
                 return 403, {"error": "worker_not_available"}
             capabilities = json.loads(worker["capabilities_json"] or "[]")
             active_count = len(json.loads(worker["active_runs_json"] or "[]"))
-            desired_concurrency = max(1, int(worker["desired_concurrency"] or 1))
             max_concurrency = max(1, int(worker["max_concurrency"] or 1))
+            initial_concurrency = max(1, min(int(worker["initial_concurrency"] or 1), max_concurrency))
+            concurrency_policy = str(worker["concurrency_policy"] or "fixed")
+            desired_concurrency = max(1, min(int(worker["desired_concurrency"] or 1), max_concurrency))
             controller_limit = max(0, min(desired_concurrency, max_concurrency) - active_count)
             limit = min(limit, controller_limit)
             if limit <= 0:
@@ -1459,6 +1666,8 @@ class Handler(BaseHTTPRequestHandler):
                     "tasks": [],
                     "desired_concurrency": desired_concurrency,
                     "max_concurrency": max_concurrency,
+                    "initial_concurrency": initial_concurrency,
+                    "concurrency_policy": concurrency_policy,
                     "active_count": active_count,
                 }
             rows = conn.execute(
@@ -1500,6 +1709,8 @@ class Handler(BaseHTTPRequestHandler):
                         "controller_concurrency": {
                             "desired_concurrency": desired_concurrency,
                             "max_concurrency": max_concurrency,
+                            "initial_concurrency": initial_concurrency,
+                            "concurrency_policy": concurrency_policy,
                             "active_count_at_claim": active_count,
                         },
                     }
@@ -1519,6 +1730,8 @@ class Handler(BaseHTTPRequestHandler):
             "tasks": claimed,
             "desired_concurrency": desired_concurrency,
             "max_concurrency": max_concurrency,
+            "initial_concurrency": initial_concurrency,
+            "concurrency_policy": concurrency_policy,
             "active_count": active_count,
         }
 
@@ -1533,6 +1746,194 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(status, response)
                 return
             time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
+    def _lease_task_for_worker(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        operator: str,
+    ) -> tuple[int, dict[str, Any]]:
+        lease_seconds = max(30, int(lease_seconds or 600))
+        lease_until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=lease_seconds)).isoformat()
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            worker = conn.execute("SELECT * FROM workers WHERE worker_id=?", (worker_id,)).fetchone()
+            if worker is None or int(worker["blocked"] or 0):
+                conn.rollback()
+                return 403, {"error": "worker_not_available", "worker_id": worker_id}
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if task is None:
+                conn.rollback()
+                return 404, {"error": "task_not_found", "task_id": task_id}
+            if task["state"] not in {"queued", "retry_queued"}:
+                conn.rollback()
+                return 409, {"error": "task_not_queueable", "task_id": task_id, "state": task["state"]}
+            capabilities = json.loads(worker["capabilities_json"] or "[]")
+            if not worker_can_run(task, capabilities, worker_id):
+                conn.rollback()
+                return 409, {"error": "worker_not_eligible", "task_id": task_id, "worker_id": worker_id}
+            desired_concurrency = max(1, int(worker["desired_concurrency"] or 1))
+            max_concurrency = max(1, int(worker["max_concurrency"] or 1))
+            initial_concurrency = max(1, min(int(worker["initial_concurrency"] or 1), max_concurrency))
+            concurrency_policy = str(worker["concurrency_policy"] or "fixed")
+            reported_active = len(json.loads(worker["active_runs_json"] or "[]"))
+            leased_active = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE lease_worker_id=? AND state IN ('leased','running')",
+                    (worker_id,),
+                ).fetchone()[0]
+            )
+            active_count = max(reported_active, leased_active)
+            if active_count >= min(desired_concurrency, max_concurrency):
+                conn.commit()
+                return 429, {
+                    "error": "worker_capacity_reached",
+                    "worker_id": worker_id,
+                    "active_count": active_count,
+                    "desired_concurrency": desired_concurrency,
+                    "max_concurrency": max_concurrency,
+                    "initial_concurrency": initial_concurrency,
+                    "concurrency_policy": concurrency_policy,
+                }
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE tasks
+                SET state='leased', lease_worker_id=?, lease_until=?, updated_at=?
+                WHERE task_id=? AND state IN ('queued','retry_queued')
+                """,
+                (worker_id, lease_until, now, task_id),
+            )
+            push_id = "push-" + str(uuid.uuid4())
+            log_task_event(
+                conn,
+                task_id,
+                "task_leased_for_push",
+                "controller",
+                operator,
+                task["state"],
+                "leased",
+                {"worker_id": worker_id, "lease_until": lease_until, "push_id": push_id},
+            )
+            conn.commit()
+        return 200, {
+            "task_id": task["task_id"],
+            "lease_until": lease_until,
+            "case_id": task["case_id"],
+            "run_id": task["run_id"],
+            "setting_id": task["setting_id"],
+            "case_version": task["case_version"],
+            "scenario_id": task["scenario_id"],
+            "package_id": task["package_id"],
+            "attempt_no": int(task["attempt_no"] or 1),
+            "assigned_worker_id": worker_id,
+            "payload": json.loads(task["payload_json"] or "{}"),
+            "components": json.loads(task["components_json"] or "{}"),
+            "controller_concurrency": {
+                "desired_concurrency": desired_concurrency,
+                "max_concurrency": max_concurrency,
+                "initial_concurrency": initial_concurrency,
+                "concurrency_policy": concurrency_policy,
+                "active_count_at_claim": active_count,
+                "dispatch_mode": "direct-push",
+            },
+            "controller_push": {"push_id": push_id, "leased_at": now},
+        }
+
+    def _direct_worker_endpoint(self, worker_id: str) -> tuple[str, str] | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT connection_mode,endpoint_json FROM worker_hosts WHERE worker_id=? ORDER BY updated_at DESC LIMIT 1",
+                (worker_id,),
+            ).fetchone()
+        if row is None or str(row["connection_mode"] or "") != "direct-worker-api":
+            return None
+        endpoint = json.loads(row["endpoint_json"] or "{}")
+        url = str(endpoint.get("worker_url") or "").strip().rstrip("/")
+        if not url:
+            host = endpoint.get("private_host") or endpoint.get("host")
+            port = int(endpoint.get("command_port") or 9876)
+            if not host:
+                return None
+            url = f"http://{host}:{port}"
+        token_env = str(endpoint.get("direct_api_token_env") or self.server.runner_token_env or DEFAULT_RUNNER_TOKEN_ENV)
+        return url, token_env
+
+    def _push_task(self) -> None:
+        payload = self._read_json()
+        task_id = str(payload.get("task_id") or "")
+        worker_id = str(payload.get("worker_id") or "")
+        operator = str(payload.get("operator") or "direct-push")
+        if not task_id or not worker_id:
+            self._json(400, {"error": "task_id_and_worker_id_required"})
+            return
+        endpoint = self._direct_worker_endpoint(worker_id)
+        if endpoint is None:
+            self._json(409, {"error": "direct_worker_endpoint_not_registered", "worker_id": worker_id})
+            return
+        url, token_env = endpoint
+        parsed = urlparse(url)
+        runner_token = token_from_env(token_env)
+        if not runner_token and not is_loopback_host(parsed.hostname or ""):
+            self._json(400, {"error": "runner_token_missing", "worker_id": worker_id, "token_env": token_env})
+            return
+        status, task = self._lease_task_for_worker(
+            task_id=task_id,
+            worker_id=worker_id,
+            lease_seconds=int(payload.get("lease_seconds") or 600),
+            operator=operator,
+        )
+        if status != 200:
+            self._json(status, task)
+            return
+        try:
+            runner_response = http_request_json(
+                url + "/api/tasks/execute",
+                {"task": task},
+                token=runner_token,
+                timeout=max(10, min(int(payload.get("push_timeout_seconds") or 30), 120)),
+            )
+        except Exception as exc:
+            # The request may have reached the Runner even when its response did not.
+            # Keep the lease to prevent a duplicate execution; normal lease expiry recovers it.
+            with self._db() as conn:
+                log_control(
+                    conn,
+                    self.server,
+                    "warning",
+                    "push_delivery_unknown",
+                    f"push delivery for task {task_id} to worker {worker_id} has unknown outcome",
+                    worker_id=worker_id,
+                    task_id=task_id,
+                    payload={"url": url, "error": f"{type(exc).__name__}: {exc}"},
+                )
+                conn.commit()
+            self._json(
+                502,
+                {
+                    "error": "push_delivery_unknown",
+                    "task_id": task_id,
+                    "worker_id": worker_id,
+                    "state": "leased",
+                    "lease_until": task["lease_until"],
+                },
+            )
+            return
+        with self._db() as conn:
+            log_control(
+                conn,
+                self.server,
+                "info",
+                "task_pushed",
+                f"controller pushed leased task {task_id} to worker {worker_id}",
+                worker_id=worker_id,
+                task_id=task_id,
+                payload={"url": url, "runner_response": runner_response, "attempt_no": task["attempt_no"]},
+            )
+            conn.commit()
+        self._json(202, {"ok": True, "task_id": task_id, "worker_id": worker_id, "lease_until": task["lease_until"], "runner": runner_response})
 
     def _task_state_from_worker(self, new_state: str, event_type: str) -> None:
         payload = self._read_json()
@@ -1931,6 +2332,17 @@ class Handler(BaseHTTPRequestHandler):
             hosts = payload.get("workers")
         if hosts is None and payload.get("inventory") is not None:
             inventory = payload.get("inventory") or {}
+            try:
+                inventory_version = int(inventory.get("inventory_version"))
+            except (AttributeError, TypeError, ValueError):
+                self._json(400, {"error": "inventory_version_required", "expected": INVENTORY_SCHEMA_VERSION})
+                return
+            if inventory_version != INVENTORY_SCHEMA_VERSION:
+                self._json(
+                    400,
+                    {"error": "unsupported_inventory_version", "expected": INVENTORY_SCHEMA_VERSION, "received": inventory_version},
+                )
+                return
             hosts = inventory.get("workers") or []
         if not isinstance(hosts, list) or not hosts:
             self._json(400, {"error": "hosts_required"})
@@ -1954,11 +2366,20 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
 
-def request_json(url: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8-sig"))
+def request_json(url: str, payload: dict[str, Any] | None = None, *, token: str | None = None, timeout: int = 20) -> dict[str, Any]:
+    return http_request_json(url, payload, token=token, timeout=timeout)
+
+
+def controller_token(args: argparse.Namespace) -> str | None:
+    return token_from_env(getattr(args, "controller_token_env", DEFAULT_HUB_TOKEN_ENV))
+
+
+def add_controller_auth_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--controller-token-env",
+        default=DEFAULT_HUB_TOKEN_ENV,
+        help="Environment variable containing the Hub bearer token. Leave unset only for a loopback-only Hub.",
+    )
 
 
 def parse_key_value(items: list[str]) -> dict[str, str]:
@@ -1975,6 +2396,9 @@ def parse_key_value(items: list[str]) -> dict[str, str]:
 
 
 def cmd_server(args: argparse.Namespace) -> int:
+    auth_token = token_from_env(args.auth_token_env)
+    if not is_loopback_host(args.host) and not auth_token:
+        raise ValueError("non-loopback Hub bind requires --auth-token-env with a configured token")
     db_path = args.db.resolve()
     artifact_root = args.artifact_root.resolve()
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -1987,7 +2411,20 @@ def cmd_server(args: argparse.Namespace) -> int:
     server.artifact_root = artifact_root
     server.control_log_path = args.control_log.resolve() if args.control_log else None
     server.upload_lock = threading.Lock()
-    print(json.dumps({"event": "controller_started", "url": f"http://{args.host}:{args.port}", "db": str(db_path)}, ensure_ascii=False), flush=True)
+    server.auth_token = auth_token
+    server.runner_token_env = args.runner_token_env
+    print(
+        json.dumps(
+            {
+                "event": "controller_started",
+                "url": f"http://{args.host}:{args.port}",
+                "db": str(db_path),
+                "auth_required": bool(auth_token),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     server.serve_forever()
     return 0
 
@@ -2015,7 +2452,11 @@ def cmd_dispatch_smoke(args: argparse.Namespace) -> int:
                 },
             }
         )
-    out = request_json(args.controller.rstrip("/") + "/api/tasks/dispatch", {"operator": args.operator, "tasks": tasks})
+    out = request_json(
+        args.controller.rstrip("/") + "/api/tasks/dispatch",
+        {"schema_version": DISPATCH_SCHEMA_VERSION, "operator": args.operator, "tasks": tasks},
+        token=controller_token(args),
+    )
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
@@ -2047,7 +2488,8 @@ def cmd_dispatch_repo_run(args: argparse.Namespace) -> int:
     }
     out = request_json(
         args.controller.rstrip("/") + "/api/tasks/dispatch",
-        {"operator": args.operator, "tasks": [task]},
+        {"schema_version": DISPATCH_SCHEMA_VERSION, "operator": args.operator, "tasks": [task]},
+        token=controller_token(args),
     )
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
@@ -2060,7 +2502,13 @@ def cmd_dispatch_spec(args: argparse.Namespace) -> int:
         payload = read_json(args.spec)
     if "operator" not in payload:
         payload["operator"] = args.operator
-    out = request_json(args.controller.rstrip("/") + "/api/tasks/dispatch", payload)
+    out = request_json(args.controller.rstrip("/") + "/api/tasks/dispatch", payload, token=controller_token(args))
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    out = request_json(args.controller.rstrip("/") + "/api/meta", token=controller_token(args))
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
@@ -2068,13 +2516,13 @@ def cmd_dispatch_spec(args: argparse.Namespace) -> int:
 def cmd_summary(args: argparse.Namespace) -> int:
     base = args.controller.rstrip("/")
     summary = {
-        "health": request_json(base + "/api/healthz"),
-        "worker_hosts": request_json(base + "/api/data/worker-hosts"),
-        "workers": request_json(base + "/api/data/active-workers"),
-        "tasks": request_json(base + "/api/tasks?limit=200"),
-        "results": request_json(base + f"/api/data/new-results?cursor={args.cursor}&limit=200"),
-        "error_rate": request_json(base + "/api/data/error-rate?by=state&window_seconds=86400"),
-        "control_log": request_json(base + "/api/data/control-log?limit=100"),
+        "health": request_json(base + "/api/healthz", token=controller_token(args)),
+        "worker_hosts": request_json(base + "/api/data/worker-hosts", token=controller_token(args)),
+        "workers": request_json(base + "/api/data/active-workers", token=controller_token(args)),
+        "tasks": request_json(base + "/api/tasks?limit=200", token=controller_token(args)),
+        "results": request_json(base + f"/api/data/new-results?cursor={args.cursor}&limit=200", token=controller_token(args)),
+        "error_rate": request_json(base + "/api/data/error-rate?by=state&window_seconds=86400", token=controller_token(args)),
+        "control_log": request_json(base + "/api/data/control-log?limit=100", token=controller_token(args)),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
@@ -2089,6 +2537,7 @@ def cmd_set_worker_concurrency(args: argparse.Namespace) -> int:
             "operator": args.operator,
             "reason": args.reason,
         },
+        token=controller_token(args),
     )
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
@@ -2099,6 +2548,37 @@ def cmd_register_worker_hosts(args: argparse.Namespace) -> int:
     out = request_json(
         args.controller.rstrip("/") + "/api/admin/register-worker-hosts",
         {"operator": args.operator, "inventory": inventory},
+        token=controller_token(args),
+    )
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_retry_task(args: argparse.Namespace) -> int:
+    out = request_json(
+        args.controller.rstrip("/") + "/api/admin/retry-task",
+        {
+            "task_id": args.task_id,
+            "operator": args.operator,
+            "preserve_excluded_workers": args.preserve_excluded_workers,
+        },
+        token=controller_token(args),
+    )
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_push_task(args: argparse.Namespace) -> int:
+    out = request_json(
+        args.controller.rstrip("/") + "/api/admin/push-task",
+        {
+            "task_id": args.task_id,
+            "worker_id": args.worker_id,
+            "operator": args.operator,
+            "lease_seconds": args.lease_seconds,
+            "push_timeout_seconds": args.push_timeout_seconds,
+        },
+        token=controller_token(args),
     )
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
@@ -2106,6 +2586,7 @@ def cmd_register_worker_hosts(args: argparse.Namespace) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Loom Hub.")
+    parser.add_argument("--version", action="version", version=f"Loom Hub Core Preview {CORE_PREVIEW_VERSION} (Hub API v{HUB_API_VERSION})")
     parser.add_argument("--benchmark-root", type=Path, default=Path(__file__).resolve().parents[1])
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -2115,6 +2596,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--db", type=Path, default=Path("loom-runs/hub/hub.sqlite"))
     p.add_argument("--artifact-root", type=Path, default=Path("loom-runs/hub/artifacts"))
     p.add_argument("--control-log", type=Path, default=Path("loom-runs/hub/hub.jsonl"))
+    p.add_argument("--auth-token-env", default=DEFAULT_HUB_TOKEN_ENV, help="Environment variable containing the Hub bearer token. Required when binding outside loopback.")
+    p.add_argument("--runner-token-env", default=DEFAULT_RUNNER_TOKEN_ENV, help="Default environment variable on the Hub host containing Direct Runner API tokens.")
     p.set_defaults(func=cmd_server)
 
     p = sub.add_parser("init-db")
@@ -2129,6 +2612,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--operator", default="local-smoke")
     p.add_argument("--command", default="python3 -c \"print('loom smoke ok')\"")
     p.add_argument("--timeout-seconds", type=int, default=60)
+    add_controller_auth_arg(p)
     p.set_defaults(func=cmd_dispatch_smoke)
 
     p = sub.add_parser("dispatch-repo-run")
@@ -2148,18 +2632,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--timeout-seconds", type=int, default=300)
     p.add_argument("--materialize-timeout-seconds", type=int, default=600)
     p.add_argument("--continue-on-error", action="store_true")
+    add_controller_auth_arg(p)
     p.set_defaults(func=cmd_dispatch_repo_run)
 
     p = sub.add_parser("dispatch-spec")
     p.add_argument("--controller", default="http://127.0.0.1:8765")
     p.add_argument("--operator", default="local-operator")
     p.add_argument("spec", type=Path, help="JSON dispatch payload, or '-' for stdin.")
+    add_controller_auth_arg(p)
     p.set_defaults(func=cmd_dispatch_spec)
 
     p = sub.add_parser("summary")
     p.add_argument("--controller", default="http://127.0.0.1:8765")
     p.add_argument("--cursor", type=int, default=0)
+    add_controller_auth_arg(p)
     p.set_defaults(func=cmd_summary)
+
+    p = sub.add_parser("capabilities")
+    p.add_argument("--controller", default="http://127.0.0.1:8765")
+    add_controller_auth_arg(p)
+    p.set_defaults(func=cmd_capabilities)
 
     p = sub.add_parser("set-worker-concurrency")
     p.add_argument("--controller", default="http://127.0.0.1:8765")
@@ -2167,13 +2659,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--desired-concurrency", type=int, required=True)
     p.add_argument("--operator", default="local-admin")
     p.add_argument("--reason", default="manual concurrency update")
+    add_controller_auth_arg(p)
     p.set_defaults(func=cmd_set_worker_concurrency)
 
     p = sub.add_parser("register-worker-hosts")
     p.add_argument("--controller", default="http://127.0.0.1:8765")
     p.add_argument("--operator", default="local-admin")
     p.add_argument("inventory", type=Path)
+    add_controller_auth_arg(p)
     p.set_defaults(func=cmd_register_worker_hosts)
+
+    p = sub.add_parser("retry-task")
+    p.add_argument("--controller", default="http://127.0.0.1:8765")
+    p.add_argument("--task-id", required=True)
+    p.add_argument("--operator", default="local-admin")
+    p.add_argument("--preserve-excluded-workers", action="store_true")
+    add_controller_auth_arg(p)
+    p.set_defaults(func=cmd_retry_task)
+
+    p = sub.add_parser("push-task")
+    p.add_argument("--controller", default="http://127.0.0.1:8765")
+    p.add_argument("--task-id", required=True)
+    p.add_argument("--worker-id", required=True)
+    p.add_argument("--operator", default="direct-push")
+    p.add_argument("--lease-seconds", type=int, default=600)
+    p.add_argument("--push-timeout-seconds", type=int, default=30)
+    add_controller_auth_arg(p)
+    p.set_defaults(func=cmd_push_task)
 
     return parser.parse_args(argv)
 

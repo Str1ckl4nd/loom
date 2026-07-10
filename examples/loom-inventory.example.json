@@ -1,4 +1,5 @@
 {
+  "inventory_version": 1,
   "connection_defaults": {
     "ssh_control_persist": "10m"
   },
@@ -24,6 +25,8 @@
       "cpu": 2,
       "memory_gb": 2,
       "max_concurrency": 16,
+      "initial_concurrency": 1,
+      "concurrency_policy": "adaptive",
       "capabilities": ["linux", "tencent", "small"]
     },
     {
@@ -37,6 +40,8 @@
       "cpu": 2,
       "memory_gb": 4,
       "max_concurrency": 32,
+      "initial_concurrency": 1,
+      "concurrency_policy": "adaptive",
       "capabilities": ["linux", "tencent", "medium"]
     },
     {
@@ -50,6 +55,8 @@
       "cpu": 2,
       "memory_gb": 8,
       "max_concurrency": 48,
+      "initial_concurrency": 1,
+      "concurrency_policy": "adaptive",
       "capabilities": ["linux", "tencent", "memory"]
     },
     {
@@ -60,10 +67,14 @@
       "key_path": "~/.ssh/tencent-cloud.pem",
       "connection_mode": "direct-worker-api",
       "command_port": 9876,
+      "direct_api_dispatch_mode": "push",
+      "direct_api_token_env": "LOOM_RUNNER_TOKEN",
       "instance_type": "S6.LARGE8",
       "cpu": 4,
       "memory_gb": 8,
       "max_concurrency": 96,
+      "initial_concurrency": 1,
+      "concurrency_policy": "adaptive",
       "capabilities": ["linux", "tencent", "large"]
     },
     {
@@ -77,6 +88,8 @@
       "cpu": 8,
       "memory_gb": 16,
       "max_concurrency": 160,
+      "initial_concurrency": 1,
+      "concurrency_policy": "adaptive",
       "capabilities": ["linux", "tencent", "xlarge"]
     }
   ]

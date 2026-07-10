@@ -89,7 +89,7 @@ def calibration_campaign(profiles: list[tuple[str, int]], cpu_seconds: float) ->
                     "expected": {"state": "clean"},
                 }
             )
-    return {"campaign_id": "loom-concurrency-calibration", "cases": cases}
+    return {"schema_version": 1, "campaign_id": "loom-concurrency-calibration", "cases": cases}
 
 
 def failure_command(category: str, message: str) -> str:
@@ -157,7 +157,7 @@ def failure_campaign(profiles: list[tuple[str, int]]) -> tuple[dict[str, Any], s
             },
         }
     )
-    return {"campaign_id": "loom-failure-injection", "cases": cases}, retry_task_id
+    return {"schema_version": 1, "campaign_id": "loom-failure-injection", "cases": cases}, retry_task_id
 
 
 def write_json(path: Path, payload: Any) -> None:

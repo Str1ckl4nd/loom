@@ -9,9 +9,10 @@ and manages evaluation work from there.
 - inventory-driven registration of existing Loom Hub and Loom Runner hosts;
 - `ssh-start`, `long-poll`, and `direct-worker-api` Runner connections;
 - remote, prestarted, or explicitly configured local Hub placement;
-- task normalization, dispatch, leases, adaptive concurrency, retries, logs,
+- task normalization, dispatch, leases, fixed/adaptive concurrency policies, retries, logs,
   result upload, querying, and recovery;
-- remote validation against hosts supplied by the operator.
+- remote validation against hosts supplied by the operator, including the
+  process-level cleanup performed by `loom_agentdojo_remote_smoke.py`.
 
 ## Out Of Scope
 
@@ -27,7 +28,9 @@ project roadmap. This includes:
 The operator or an external infrastructure system owns those responsibilities.
 The supported cloud workflow begins after hosts exist and an `inventory.json`
 can be supplied to `tools/loom_matrix.py` or another inventory-driven
-runner.
+runner. Loom's remote smoke helper stops only the Hub and Runner processes it
+started; explicit VM stop/delete and billing verification remain an operator
+workflow step.
 
 ## Retained Reference Helpers
 

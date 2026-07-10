@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import glob
+import hashlib
 import json
 import os
 import platform
@@ -30,6 +31,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
+
+from loom_contract import CONCURRENCY_POLICIES, CORE_PREVIEW_VERSION, RUNNER_API_VERSION, metadata
+from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, bearer_headers, is_loopback_host, token_from_env, token_matches
 
 
 DEFAULT_LOCAL_COPY_IGNORES = {
@@ -90,24 +94,41 @@ def write_json(path: Path, payload: Any) -> None:
         f.write("\n")
 
 
-def request_json(base: str, path: str, payload: dict[str, Any] | None = None, timeout: int = 30) -> dict[str, Any]:
+def request_json(
+    base: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    timeout: int = 30,
+    token: str | None = None,
+) -> dict[str, Any]:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = Request(base.rstrip("/") + path, data=data, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    headers.update(bearer_headers(token))
+    req = Request(base.rstrip("/") + path, data=data, headers=headers)
     with urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8-sig"))
 
 
-def upload_file(base: str, task_id: str, worker_id: str, path: Path, timeout: int = 120) -> dict[str, Any]:
+def upload_file(
+    base: str,
+    task_id: str,
+    worker_id: str,
+    path: Path,
+    timeout: int = 120,
+    token: str | None = None,
+) -> dict[str, Any]:
     data = path.read_bytes()
+    headers = {
+        "Content-Type": "application/zip",
+        "X-Task-Id": task_id,
+        "X-Worker-Id": worker_id,
+        "Content-Length": str(len(data)),
+    }
+    headers.update(bearer_headers(token))
     req = Request(
         base.rstrip("/") + "/api/results/upload",
         data=data,
-        headers={
-            "Content-Type": "application/zip",
-            "X-Task-Id": task_id,
-            "X-Worker-Id": worker_id,
-            "Content-Length": str(len(data)),
-        },
+        headers=headers,
     )
     with urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8-sig"))
@@ -121,7 +142,10 @@ def shell_command(payload: dict[str, Any]) -> list[str] | str:
 
 
 def command_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    commands = payload.get("commands")
+    commands = payload.get("phases")
+    is_phase_list = commands is not None
+    if commands is None:
+        commands = payload.get("commands")
     if commands is None:
         commands = [shell_command(payload)]
     if isinstance(commands, str):
@@ -135,6 +159,9 @@ def command_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             spec = {"command": raw}
         spec.setdefault("name", f"command-{idx:02d}")
+        if is_phase_list:
+            spec.setdefault("phase", spec["name"])
+            spec.setdefault("phase_index", idx)
         out.append(spec)
     return out
 
@@ -145,7 +172,31 @@ def build_env(payload: dict[str, Any], command_spec: dict[str, Any] | None = Non
         env[str(key)] = str(value)
     for key, value in ((command_spec or {}).get("env") or {}).items():
         env[str(key)] = str(value)
+    # Scheduler-owned metadata is immutable from a campaign or phase process.
+    for key, value in (payload.get("_loom_runtime_env") or {}).items():
+        env[str(key)] = str(value)
+    if command_spec:
+        phase_name = command_spec.get("phase") or command_spec.get("name")
+        if phase_name:
+            env["LOOM_PHASE_NAME"] = str(phase_name)
+        if command_spec.get("phase_index") is not None:
+            env["LOOM_PHASE_INDEX"] = str(command_spec["phase_index"])
     return env
+
+
+def command_with_args(spec: dict[str, Any]) -> list[str] | str:
+    command = spec.get("command")
+    args = spec.get("args") or []
+    if not args:
+        return command
+    if not isinstance(args, list):
+        raise ValueError("command args must be a list")
+    rendered_args = [str(item) for item in args]
+    if isinstance(command, str):
+        return command + " " + " ".join(shlex.quote(item) for item in rendered_args)
+    if isinstance(command, list):
+        return [*map(str, command), *rendered_args]
+    raise ValueError("command must be a string or list when args are present")
 
 
 def run_process(
@@ -321,7 +372,11 @@ def copy_file_preserving_relative(src: Path, base: Path, dest_root: Path) -> dic
     dest = dest_root / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
-    return {"path": rel.as_posix(), "bytes": src.stat().st_size}
+    digest = hashlib.sha256()
+    with src.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": rel.as_posix(), "bytes": src.stat().st_size, "sha256": digest.hexdigest()}
 
 
 def collect_artifacts(workspace_dir: Path, task_dir: Path, patterns: list[str]) -> list[dict[str, Any]]:
@@ -351,6 +406,7 @@ def collect_artifacts(workspace_dir: Path, task_dir: Path, patterns: list[str]) 
                 seen.add(resolved)
                 collected.append(copy_file_preserving_relative(file_path, workspace_dir, artifact_root))
     write_json(task_dir / "artifact-summary.json", {"artifacts": collected})
+    write_json(task_dir / "artifact-manifest.json", {"schema_version": 1, "artifacts": collected})
     return collected
 
 
@@ -469,9 +525,10 @@ def run_repo_task(payload: dict[str, Any], task_dir: Path) -> dict[str, Any]:
     workspace_dir, materialized = materialize_workspace(payload, task_dir)
     command_results: list[dict[str, Any]] = []
     exit_code = 0 if materialized.get("ok") else 2
+    commands = command_list(payload)
     if exit_code == 0:
-        for idx, spec in enumerate(command_list(payload), start=1):
-            command = spec.get("command")
+        for idx, spec in enumerate(commands, start=1):
+            command = command_with_args(spec)
             if not command:
                 continue
             timeout = int(spec.get("timeout_seconds") or payload.get("timeout_seconds") or 300)
@@ -482,16 +539,34 @@ def run_repo_task(payload: dict[str, Any], task_dir: Path) -> dict[str, Any]:
             proc = run_process(command, cwd=cwd, timeout=timeout, env=build_env(payload, spec))
             command_result = write_command_logs(task_dir, f"{idx:02d}-{spec.get('name')}", proc)
             command_result["cwd"] = rel_cwd
+            command_result["phase"] = str(spec.get("phase") or spec.get("name") or f"command-{idx:02d}")
+            command_result["phase_index"] = int(spec.get("phase_index") or idx)
+            command_result["timeout_seconds"] = timeout
             command_results.append(command_result)
             if proc.returncode != 0:
                 exit_code = int(proc.returncode)
-                if not payload.get("continue_on_error"):
+                continue_on_error = (
+                    bool(spec["continue_on_error"])
+                    if "continue_on_error" in spec
+                    else bool(payload.get("continue_on_error"))
+                )
+                if not continue_on_error:
                     break
+    phase_report = {
+        "schema_version": 1,
+        "task_id": str((payload.get("_loom_runtime_env") or {}).get("LOOM_TASK_ID") or ""),
+        "attempt_no": int((payload.get("_loom_runtime_env") or {}).get("LOOM_ATTEMPT_NO") or 1),
+        "phases": command_results,
+    }
+    write_json(task_dir / "phase-results.json", phase_report)
     artifact_patterns = [str(p) for p in payload.get("artifact_paths") or payload.get("artifacts") or []]
+    for spec in commands:
+        artifact_patterns.extend(str(pattern) for pattern in spec.get("artifact_paths") or [])
     artifacts = collect_artifacts(workspace_dir, task_dir, artifact_patterns) if workspace_dir.exists() else []
     return {
         "materialized": materialized,
         "commands": command_results,
+        "phases": command_results,
         "artifacts": artifacts,
         "exit_code": exit_code,
         "verdict": "clean" if exit_code == 0 else "run_error",
@@ -513,13 +588,21 @@ def zip_task_dir(task_dir: Path, zip_path: Path) -> None:
 def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any]]:
     task_id = task["task_id"]
     payload = dict(task.get("payload") or {})
-    payload["env"] = {
-        **(payload.get("env") or {}),
+    normalized = payload.get("normalized") if isinstance(payload.get("normalized"), dict) else {}
+    payload["_loom_runtime_env"] = {
         "LOOM_TASK_ID": task_id,
         "LOOM_ATTEMPT_NO": str(max(1, int(task.get("attempt_no") or 1))),
         "LOOM_WORKER_ID": str(task.get("assigned_worker_id") or ""),
+        "LOOM_CAMPAIGN_ID": str(normalized.get("campaign_id") or ""),
+        "LOOM_CASE_ID": str(task.get("case_id") or normalized.get("case_id") or ""),
+        "LOOM_RUN_ID": str(task.get("run_id") or normalized.get("run_id") or ""),
+        "LOOM_SETTING_ID": str(task.get("setting_id") or normalized.get("setting_id") or ""),
     }
-    task_dir = work_root / task_id
+    attempt_no = max(1, int(task.get("attempt_no") or 1))
+    task_root = work_root / task_id
+    task_dir = task_root / f"attempt-{attempt_no:03d}"
+    # A retry must never inherit prior logs, artifacts, or a workspace checkout.
+    shutil.rmtree(task_dir, ignore_errors=True)
     task_dir.mkdir(parents=True, exist_ok=True)
     write_json(task_dir / "task.json", task)
 
@@ -583,10 +666,68 @@ def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any
     }
     if runner == "repo":
         result["repo_result_path"] = "stdout.txt"
+        result["phase_result_path"] = "phase-results.json"
+    if normalized:
+        result["normalized"] = normalized
     write_json(task_dir / "worker-result.json", result)
-    zip_path = work_root / f"{task_id}.zip"
+    zip_path = task_root / f"attempt-{attempt_no:03d}.zip"
     zip_task_dir(task_dir, zip_path)
     return zip_path, result
+
+
+def controller_token(args: argparse.Namespace) -> str | None:
+    return getattr(args, "controller_token", None)
+
+
+class LeaseRenewer:
+    """Keep a controller-owned lease live while a task or result upload runs."""
+
+    def __init__(self, args: argparse.Namespace, task_id: str):
+        self.args = args
+        self.task_id = task_id
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.renewal_count = 0
+        self.last_error: str | None = None
+        self.lock = threading.Lock()
+
+    def _interval_seconds(self) -> int:
+        lease_seconds = max(30, int(self.args.lease_seconds))
+        return max(10, min(120, lease_seconds // 3))
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self._interval_seconds()):
+            try:
+                request_json(
+                    self.args.controller,
+                    "/api/tasks/renew",
+                    {
+                        "worker_id": self.args.worker_id,
+                        "task_id": self.task_id,
+                        "lease_seconds": self.args.lease_seconds,
+                    },
+                    timeout=max(30, min(int(self.args.lease_seconds), 120)),
+                    token=controller_token(self.args),
+                )
+                with self.lock:
+                    self.renewal_count += 1
+                    self.last_error = None
+            except Exception as exc:
+                # The task still owns its current lease. Keep trying until the
+                # worker can report a definitive completion or failure.
+                with self.lock:
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> dict[str, Any]:
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+        with self.lock:
+            return {"renewal_count": self.renewal_count, "last_error": self.last_error}
 
 
 def heartbeat(args: argparse.Namespace, current_runs: list[dict[str, Any]], phase: str) -> dict[str, Any]:
@@ -604,6 +745,7 @@ def heartbeat(args: argparse.Namespace, current_runs: list[dict[str, Any]], phas
                 "time": utc_now(),
             },
         },
+        token=controller_token(args),
     )
 
 
@@ -616,8 +758,11 @@ def register(args: argparse.Namespace) -> dict[str, Any]:
             "capabilities": args.capability,
             "max_concurrency": args.max_concurrency,
             "initial_concurrency": args.initial_concurrency,
+            "concurrency_policy": args.concurrency_policy,
+            "runner_api_version": RUNNER_API_VERSION,
             "health": {"hostname": socket.gethostname(), "platform": platform.platform(), "resources": resource_snapshot()},
         },
+        token=controller_token(args),
     )
 
 
@@ -627,6 +772,7 @@ def handle_one(args: argparse.Namespace, work_root: Path) -> bool:
         args.controller,
         "/api/tasks/claim",
         {"worker_id": args.worker_id, "limit": 1, "lease_seconds": args.lease_seconds},
+        token=controller_token(args),
     )
     tasks = claim.get("tasks") or []
     if not tasks:
@@ -636,19 +782,22 @@ def handle_one(args: argparse.Namespace, work_root: Path) -> bool:
     task_id = task["task_id"]
     current = [{"task_id": task_id, "package_id": task.get("package_id"), "phase": "starting"}]
     heartbeat(args, current, "starting")
-    request_json(args.controller, "/api/tasks/start", {"worker_id": args.worker_id, "task_id": task_id})
+    request_json(args.controller, "/api/tasks/start", {"worker_id": args.worker_id, "task_id": task_id}, token=controller_token(args))
+    lease_renewer = LeaseRenewer(args, task_id)
+    lease_renewer.start()
     try:
         current[0]["phase"] = "running"
         heartbeat(args, current, "running")
         zip_path, result = run_task(task, work_root)
         current[0]["phase"] = "uploading"
         heartbeat(args, current, "uploading")
-        upload = upload_file(args.controller, task_id, args.worker_id, zip_path)
+        upload = upload_file(args.controller, task_id, args.worker_id, zip_path, token=controller_token(args))
         if not (upload.get("auto_retry") or {}).get("queued"):
             request_json(
                 args.controller,
                 "/api/tasks/complete",
                 {"worker_id": args.worker_id, "task_id": task_id, "result": result, "upload": upload},
+                token=controller_token(args),
             )
         heartbeat(args, [], "completed")
         return True
@@ -662,11 +811,14 @@ def handle_one(args: argparse.Namespace, work_root: Path) -> bool:
                 "controller_concurrency": task.get("controller_concurrency") or {},
                 "error": {"type": type(exc).__name__, "detail": str(exc)},
             },
+            token=controller_token(args),
         )
         heartbeat(args, [], "failed")
         if args.fail_fast:
             raise
         return True
+    finally:
+        lease_renewer.stop()
 
 
 def claim_tasks(
@@ -689,21 +841,25 @@ def claim_tasks(
         "/api/tasks/claim",
         payload,
         timeout=max(30, int(args.claim_wait_seconds) + 10),
+        token=controller_token(args),
     )
     return claim.get("tasks") or []
 
 
 def execute_claimed_task(args: argparse.Namespace, work_root: Path, task: dict[str, Any]) -> dict[str, Any]:
     task_id = task["task_id"]
-    request_json(args.controller, "/api/tasks/start", {"worker_id": args.worker_id, "task_id": task_id})
+    request_json(args.controller, "/api/tasks/start", {"worker_id": args.worker_id, "task_id": task_id}, token=controller_token(args))
+    lease_renewer = LeaseRenewer(args, task_id)
+    lease_renewer.start()
     try:
         zip_path, result = run_task(task, work_root)
-        upload = upload_file(args.controller, task_id, args.worker_id, zip_path)
+        upload = upload_file(args.controller, task_id, args.worker_id, zip_path, token=controller_token(args))
         if not (upload.get("auto_retry") or {}).get("queued"):
             request_json(
                 args.controller,
                 "/api/tasks/complete",
                 {"worker_id": args.worker_id, "task_id": task_id, "result": result, "upload": upload},
+                token=controller_token(args),
             )
         return {"task_id": task_id, "ok": True, "result": result, "upload": upload}
     except Exception as exc:
@@ -716,10 +872,13 @@ def execute_claimed_task(args: argparse.Namespace, work_root: Path, task: dict[s
                 "controller_concurrency": task.get("controller_concurrency") or {},
                 "error": {"type": type(exc).__name__, "detail": str(exc)},
             },
+            token=controller_token(args),
         )
         if args.fail_fast:
             raise
         return {"task_id": task_id, "ok": False, "error": {"type": type(exc).__name__, "detail": str(exc)}}
+    finally:
+        lease_renewer.stop()
 
 
 def run_concurrent_loop(args: argparse.Namespace, work_root: Path) -> int:
@@ -738,7 +897,10 @@ def run_concurrent_loop(args: argparse.Namespace, work_root: Path) -> int:
                 for meta in futures.values()
             ]
             heartbeat_response = heartbeat(args, current_runs, "running" if futures else "idle")
-            desired_concurrency = max(1, int(heartbeat_response.get("desired_concurrency") or desired_concurrency))
+            desired_concurrency = max(
+                1,
+                min(args.max_concurrency, int(heartbeat_response.get("desired_concurrency") or desired_concurrency)),
+            )
 
             while futures:
                 done = [future for future in futures if future.done()]
@@ -798,6 +960,9 @@ class DirectWorkerServer(ThreadingHTTPServer):
     state_lock: threading.Lock
     run_thread: threading.Thread | None
     last_result: dict[str, Any]
+    direct_api_token: str | None
+    push_executor: ThreadPoolExecutor
+    push_futures: dict[str, Future[dict[str, Any]]]
 
 
 class DirectWorkerHandler(BaseHTTPRequestHandler):
@@ -818,7 +983,18 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8-sig"))
 
+    def _require_auth(self) -> bool:
+        if token_matches(self.headers, self.server.direct_api_token):
+            return True
+        self._json(401, {"error": "unauthorized"})
+        return False
+
+    def _active_pushes(self) -> list[str]:
+        return [task_id for task_id, future in self.server.push_futures.items() if not future.done()]
+
     def do_GET(self) -> None:
+        if not self._require_auth():
+            return
         if self.path.rstrip("/") == "/api/healthz":
             thread = self.server.run_thread
             self._json(
@@ -827,15 +1003,38 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "worker_id": self.server.worker_args.worker_id,
                     "mode": "direct-api",
+                    "core_preview_version": CORE_PREVIEW_VERSION,
+                    "runner_api_version": RUNNER_API_VERSION,
+                    "capabilities": metadata("runner")["capabilities"],
+                    "concurrency_policy": self.server.worker_args.concurrency_policy,
+                    "initial_concurrency": self.server.worker_args.initial_concurrency,
+                    "max_concurrency": self.server.worker_args.max_concurrency,
                     "running": bool(thread and thread.is_alive()),
+                    "active_pushes": self._active_pushes(),
                     "last_result": self.server.last_result,
                     "resources": resource_snapshot(),
+                },
+            )
+            return
+        if self.path.rstrip("/") == "/api/meta":
+            self._json(
+                200,
+                {
+                    **metadata("runner"),
+                    "worker_id": self.server.worker_args.worker_id,
+                    "auth_required": bool(self.server.direct_api_token),
+                    "connection_mode": "direct-api",
+                    "concurrency_policy": self.server.worker_args.concurrency_policy,
+                    "initial_concurrency": self.server.worker_args.initial_concurrency,
+                    "max_concurrency": self.server.worker_args.max_concurrency,
                 },
             )
             return
         self._json(404, {"error": "not_found", "path": self.path})
 
     def do_POST(self) -> None:
+        if not self._require_auth():
+            return
         path = self.path.rstrip("/") or "/"
         try:
             if path == "/api/register":
@@ -845,12 +1044,18 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
             if path == "/api/run-loop":
                 self._start_run_loop(self._read_json())
                 return
+            if path == "/api/tasks/execute":
+                self._execute_task(self._read_json())
+                return
             self._json(404, {"error": "not_found", "path": self.path})
         except Exception as exc:
             self._json(500, {"error": type(exc).__name__, "detail": str(exc)})
 
     def _start_run_loop(self, payload: dict[str, Any]) -> None:
         with self.server.state_lock:
+            if self._active_pushes():
+                self._json(409, {"error": "push_tasks_active", "active_pushes": self._active_pushes()})
+                return
             thread = self.server.run_thread
             if thread and thread.is_alive():
                 self._json(202, {"ok": True, "state": "already_running", "worker_id": self.server.worker_args.worker_id})
@@ -876,11 +1081,62 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
             thread.start()
         self._json(202, {"ok": True, "state": "started", "worker_id": self.server.worker_args.worker_id})
 
+    def _execute_task(self, payload: dict[str, Any]) -> None:
+        task = payload.get("task")
+        if not isinstance(task, dict):
+            self._json(400, {"error": "task_object_required"})
+            return
+        task_id = str(task.get("task_id") or "")
+        worker_id = self.server.worker_args.worker_id
+        if not task_id:
+            self._json(400, {"error": "task_id_required"})
+            return
+        if str(task.get("assigned_worker_id") or "") != worker_id:
+            self._json(409, {"error": "assigned_worker_mismatch", "worker_id": worker_id, "task_id": task_id})
+            return
+        with self.server.state_lock:
+            loop = self.server.run_thread
+            if loop and loop.is_alive():
+                self._json(409, {"error": "pull_loop_active", "task_id": task_id})
+                return
+            existing = self.server.push_futures.get(task_id)
+            if existing and not existing.done():
+                self._json(202, {"ok": True, "state": "already_running", "task_id": task_id, "worker_id": worker_id})
+                return
+            active = self._active_pushes()
+            if len(active) >= self.server.worker_args.max_concurrency:
+                self._json(
+                    429,
+                    {
+                        "error": "worker_capacity_reached",
+                        "worker_id": worker_id,
+                        "active_pushes": active,
+                        "max_concurrency": self.server.worker_args.max_concurrency,
+                    },
+                )
+                return
+            future = self.server.push_executor.submit(execute_claimed_task, self.server.worker_args, self.server.work_root, task)
+            self.server.push_futures[task_id] = future
+            self.server.last_result = {"ok": True, "state": "accepted", "task_id": task_id, "accepted_at": utc_now()}
+
+            def complete(done: Future[dict[str, Any]]) -> None:
+                try:
+                    result = done.result()
+                except Exception as exc:
+                    result = {"task_id": task_id, "ok": False, "error": {"type": type(exc).__name__, "detail": str(exc)}}
+                with self.server.state_lock:
+                    self.server.last_result = {**result, "finished_at": utc_now()}
+
+            future.add_done_callback(complete)
+        self._json(202, {"ok": True, "state": "accepted", "task_id": task_id, "worker_id": worker_id})
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
 
 def serve_direct_api(args: argparse.Namespace, work_root: Path) -> int:
+    if not is_loopback_host(args.serve_host) and not args.direct_api_token:
+        raise ValueError("direct Worker API requires --direct-api-token-env when --serve-host is not loopback")
     register(args)
     server = DirectWorkerServer((args.serve_host, args.serve_port), DirectWorkerHandler)
     server.worker_args = args
@@ -888,6 +1144,9 @@ def serve_direct_api(args: argparse.Namespace, work_root: Path) -> int:
     server.state_lock = threading.Lock()
     server.run_thread = None
     server.last_result = {}
+    server.direct_api_token = args.direct_api_token
+    server.push_executor = ThreadPoolExecutor(max_workers=args.max_concurrency)
+    server.push_futures = {}
     print(
         json.dumps(
             {
@@ -921,7 +1180,9 @@ def serve_direct_api(args: argparse.Namespace, work_root: Path) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Loom Runner.")
+    parser.add_argument("--version", action="version", version=f"Loom Runner Core Preview {CORE_PREVIEW_VERSION} (runner API v{RUNNER_API_VERSION})")
     parser.add_argument("--controller", required=True)
+    parser.add_argument("--controller-token-env", default=DEFAULT_HUB_TOKEN_ENV, help="Environment variable containing the Hub bearer token. Leave unset only for a loopback-only Hub.")
     parser.add_argument("--worker-id", default=f"worker-{socket.gethostname()}-{uuid.uuid4().hex[:8]}")
     parser.add_argument("--capability", action="append", default=[])
     parser.add_argument("--work-dir", type=Path, default=Path("loom-runs/runner"))
@@ -929,19 +1190,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--lease-seconds", type=int, default=600)
     parser.add_argument("--max-concurrency", type=int, default=1, help="Hard worker-side concurrency cap. The controller chooses the active desired concurrency.")
     parser.add_argument("--initial-concurrency", type=int, default=1, help="Initial desired concurrency reported to the controller.")
+    parser.add_argument("--concurrency-policy", choices=sorted(CONCURRENCY_POLICIES), default="fixed", help="fixed keeps the configured level except explicit resource/rate-limit backoff; adaptive probes upward and backoff levels.")
     parser.add_argument("--max-tasks", type=int, default=0, help="0 means unlimited until --once exits on idle.")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--connection-mode", choices=["poll", "long-poll", "direct-api"], default="poll")
     parser.add_argument("--claim-wait-seconds", type=int, default=0, help="Hold empty claim requests open for this many seconds.")
-    parser.add_argument("--serve-host", default="0.0.0.0")
+    parser.add_argument("--serve-host", default="127.0.0.1")
     parser.add_argument("--serve-port", type=int, default=9876)
+    parser.add_argument("--direct-api-token-env", default=DEFAULT_RUNNER_TOKEN_ENV, help="Environment variable containing the Direct Runner API bearer token.")
     parser.add_argument("--direct-api-run-on-start", action="store_true")
     args = parser.parse_args(argv)
+    args.controller_token = token_from_env(args.controller_token_env)
+    args.direct_api_token = token_from_env(args.direct_api_token_env)
     if not args.capability:
         args.capability = ["linux" if os.name != "nt" else "windows", "*"]
-    args.max_concurrency = max(1, int(args.max_concurrency))
-    args.initial_concurrency = max(1, min(int(args.initial_concurrency), args.max_concurrency))
+    args.max_concurrency = int(args.max_concurrency)
+    args.initial_concurrency = int(args.initial_concurrency)
+    if args.max_concurrency < 1:
+        raise ValueError("max_concurrency must be positive")
+    if args.initial_concurrency < 1 or args.initial_concurrency > args.max_concurrency:
+        raise ValueError("initial_concurrency must satisfy 1 <= initial_concurrency <= max_concurrency")
     if args.connection_mode == "long-poll" and args.claim_wait_seconds <= 0:
         args.claim_wait_seconds = 25
     if args.connection_mode == "poll":

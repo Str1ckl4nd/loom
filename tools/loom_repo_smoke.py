@@ -114,7 +114,7 @@ def main(argv: list[str]) -> int:
                 "timeout_seconds": args.timeout_seconds,
             },
         }
-        request_json(base + "/api/tasks/dispatch", {"operator": "repo-smoke", "tasks": [task]})
+        request_json(base + "/api/tasks/dispatch", {"schema_version": 1, "operator": "repo-smoke", "tasks": [task]})
         worker = subprocess.Popen(
             [
                 args.python,

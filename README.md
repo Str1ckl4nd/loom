@@ -8,13 +8,15 @@
 
 Loom is a reliable, inventory-driven task control plane for agent evaluation.
 It dispatches normalized work across operator-owned hosts: the **Loom Hub** owns
-scheduling, leases, adaptive concurrency, retries, and result intake; **Loom
+scheduling, leases, concurrency policy, retries, and result intake; **Loom
 Runners** execute ordered task packages and return compact, queryable result
 ZIPs.
 
 [Remote quick start](#remote-quick-start) |
 [Manifest](docs/TASK_MANIFEST.md) |
 [Architecture](docs/ARCHITECTURE.md) |
+[Core Preview v1](docs/CORE_PREVIEW_V1.md) |
+[Release contract](docs/RELEASE_CONTRACT.md) |
 [Support scope](docs/SCOPE.md)
 
 ## The Name
@@ -30,9 +32,16 @@ execution flow.
   case, setting, and run instead of handing a worker an ambiguous instruction.
 - **Controller-owned scheduling.** Workers advertise a hard capacity, while the
   controller controls leases, desired concurrency, retries, and recovery.
+- **Frozen Core Preview v1 contracts.** Versioned inventory, manifest, dispatch,
+  token, CLI, and capability-query contracts keep downstream automation on a
+  documented surface rather than internal Python helpers.
 - **Remote worker connections that persist.** Bootstrap workers once over SSH,
-  use long-polling for quieter idle periods, or expose a worker control API. The
-  task queue and state machine always stay in the controller.
+  use long-polling for quieter idle periods, or expose an authenticated worker
+  control API. Direct Runners can pull work or receive Hub-leased exact tasks;
+  the task queue and state machine always stay in the controller.
+- **Versioned phase contracts.** A repository task can declare named prepare,
+  evaluate, and collect phases with phase-specific arguments, environment,
+  timeouts, artifact paths, and immutable runtime IDs.
 - **Recoverable evidence.** Each attempt keeps its task ID, attempt number,
   worker identity, logs, explicit artifacts, and result ZIP. A later successful
   retry does not erase the earlier failure package.
@@ -82,6 +91,9 @@ the actual work on the hosts named in the inventory.
    remote results:
 
    ```bash
+   export LOOM_HUB_TOKEN='generate-and-store-outside-the-inventory'
+   export LOOM_RUNNER_TOKEN='separate-direct-runner-token'
+
    python3 tools/loom_matrix.py \
      --inventory /path/to/operator-owned/inventory.json \
      --dispatch-spec campaign.dispatch.json \
@@ -91,7 +103,8 @@ the actual work on the hosts named in the inventory.
 For a private source repository, add `--forward-env SOURCE_REPO_TOKEN` and make
 that variable available only in the operator environment. The worker uses it
 through `GIT_ASKPASS`; the token is not placed in task JSON, command logs, or
-result ZIPs.
+result ZIPs. Matrix forwards the Hub and Direct Runner token environment
+variables through temporary `0600` remote files and records only their names.
 
 `loom_matrix.py` deploys Loom Hub and Loom Runner scripts only. It does not
 create, resize, stop, or delete cloud resources.
@@ -119,7 +132,7 @@ Choose a connection mode per host in the inventory:
 | --- | --- |
 | `ssh-start` | SSH should bootstrap a long-lived Loom Runner, after which scheduling uses the Hub HTTP API rather than a fresh SSH session for each task. |
 | `long-poll` | An idle Loom Runner should keep a claim request open briefly instead of repeatedly polling the Hub. |
-| `direct-worker-api` | A Runner-side HTTP endpoint should accept bootstrap commands to register or continue its pull loop. Task state still belongs to Loom Hub. |
+| `direct-worker-api` | A Runner-side authenticated HTTP endpoint. Select `direct_api_dispatch_mode: "pull"` for a Runner pull loop or `"push"` for Hub-leased exact task delivery. Task state still belongs to Loom Hub. |
 
 Inventory-level `ssh_control_persist` supports SSH `ControlMaster`/
 `ControlPersist` reuse during setup. See the
@@ -155,7 +168,8 @@ delivery protocol.
 | --- | --- |
 | [Loom Scope](docs/SCOPE.md) | Before changing host, provider, or resource-lifecycle behavior. |
 | [Loom Manifest](docs/TASK_MANIFEST.md) | When preparing a campaign, retry policy, private source, or expected-result contract. |
-| [AgentDojo Example](docs/AGENTDOJO_EXAMPLE.md) | When learning how a public benchmark repository can be described without turning the example into an end-to-end run. |
+| [Release Contract](docs/RELEASE_CONTRACT.md) | When changing phases, Direct Runner delivery, authentication, result retention, or release gates. |
+| [AgentDojo Release Fixture](docs/AGENTDOJO_EXAMPLE.md) | When running or inspecting the fixed 2-case x 2-run x 2-attempt remote regression. |
 | [Architecture](docs/ARCHITECTURE.md) | When integrating the Hub, Runner, connection modes, concurrency behavior, or result APIs. |
 | [Loom Remote Validation](docs/REMOTE_VALIDATION.md) | When validating the inventory-driven remote path on operator-supplied Tencent hosts. |
 

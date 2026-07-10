@@ -29,9 +29,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
+from loom_contract import CONCURRENCY_POLICIES, CORE_PREVIEW_VERSION, INVENTORY_SCHEMA_VERSION
+from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, bearer_headers, token_from_env
+
 
 FINAL_STATES = {"clean", "dirty", "run_error", "needs_review", "accepted", "ignored", "blocked", "cancelled"}
 SSH_STARTED_MODES = {"ssh-start", "long-poll", "direct-worker-api"}
+HUB_TOKEN: str | None = None
+HUB_TOKEN_ENV = DEFAULT_HUB_TOKEN_ENV
+DEFAULT_DIRECT_RUNNER_TOKEN_ENV = DEFAULT_RUNNER_TOKEN_ENV
 
 
 def run(cmd: list[str], *, timeout: int = 120, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -115,6 +121,7 @@ def open_direct_response(
     payload: dict[str, Any] | None = None,
     *,
     timeout: int = 20,
+    token: str | None = None,
 ) -> tuple[HTTPConnection | HTTPSConnection, HTTPResponse]:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -128,6 +135,7 @@ def open_direct_response(
     headers = {"Accept": "application/json"}
     if body is not None:
         headers["Content-Type"] = "application/json"
+    headers.update(bearer_headers(HUB_TOKEN if token is None else token))
     try:
         connection.request("POST" if body is not None else "GET", path, body=body, headers=headers)
         response = connection.getresponse()
@@ -141,8 +149,8 @@ def open_direct_response(
     return connection, response
 
 
-def request_json(url: str, payload: dict[str, Any] | None = None, timeout: int = 20) -> dict[str, Any]:
-    connection, response = open_direct_response(url, payload, timeout=timeout)
+def request_json(url: str, payload: dict[str, Any] | None = None, timeout: int = 20, token: str | None = None) -> dict[str, Any]:
+    connection, response = open_direct_response(url, payload, timeout=timeout, token=token)
     try:
         return json.loads(response.read().decode("utf-8-sig"))
     finally:
@@ -162,12 +170,12 @@ def wait_http(url: str, timeout: int = 90) -> None:
     raise RuntimeError(f"controller did not become healthy: {last}")
 
 
-def wait_worker_api(url: str, timeout: int = 90) -> None:
+def wait_worker_api(url: str, timeout: int = 90, token: str | None = None) -> None:
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
         try:
-            request_json(url.rstrip("/") + "/api/healthz", timeout=5)
+            request_json(url.rstrip("/") + "/api/healthz", timeout=5, token=token)
             return
         except Exception as exc:
             last = exc
@@ -197,27 +205,68 @@ def apply_inventory_defaults(inventory: dict[str, Any]) -> dict[str, Any]:
         if isinstance(inventory.get(section), dict):
             for key, value in defaults.items():
                 inventory[section].setdefault(key, value)
-    for worker in inventory.get("workers") or []:
-        for key, value in defaults.items():
-            worker.setdefault(key, value)
+    workers = inventory.get("workers")
+    if isinstance(workers, list):
+        for worker in workers:
+            if isinstance(worker, dict):
+                for key, value in defaults.items():
+                    worker.setdefault(key, value)
     return inventory
 
 
 def load_inventory(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError("inventory must be a JSON object")
+    if "inventory_version" not in data:
+        raise ValueError("inventory requires explicit inventory_version")
+    try:
+        inventory_version = int(data["inventory_version"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("inventory_version must be an integer") from exc
+    if inventory_version != INVENTORY_SCHEMA_VERSION:
+        raise ValueError(f"unsupported inventory_version: {inventory_version}")
     data = apply_inventory_defaults(data)
-    workers = data.get("workers") or []
+    if not isinstance(data.get("controller"), dict):
+        raise ValueError("inventory requires a controller object")
+    workers = data.get("workers")
+    if not isinstance(workers, list):
+        raise ValueError("inventory workers must be an array")
     if not workers:
         raise ValueError("inventory requires at least one worker host")
+    if any(not isinstance(worker, dict) for worker in workers):
+        raise ValueError("inventory workers must be objects")
     worker_ids = [str(worker.get("worker_id") or worker.get("host") or "") for worker in workers]
     if any(not worker_id for worker_id in worker_ids) or len(set(worker_ids)) != len(worker_ids):
         raise ValueError("inventory worker IDs must be present and unique")
+    for index, worker in enumerate(workers, start=1):
+        if "max_concurrency" not in worker or "initial_concurrency" not in worker:
+            raise ValueError(f"inventory worker {worker_ids[index - 1]} requires max_concurrency and initial_concurrency")
+        try:
+            max_concurrency = int(worker["max_concurrency"])
+            initial_concurrency = int(worker["initial_concurrency"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"inventory worker {worker_ids[index - 1]} concurrency values must be integers") from exc
+        if max_concurrency < 1 or initial_concurrency < 1 or initial_concurrency > max_concurrency:
+            raise ValueError(f"inventory worker {worker_ids[index - 1]} requires 1 <= initial_concurrency <= max_concurrency")
+        policy = str(worker.get("concurrency_policy") or "").strip().lower()
+        if policy not in CONCURRENCY_POLICIES:
+            raise ValueError(f"inventory worker {worker_ids[index - 1]} requires concurrency_policy fixed or adaptive")
+        worker["max_concurrency"] = max_concurrency
+        worker["initial_concurrency"] = initial_concurrency
+        worker["concurrency_policy"] = policy
     return data
 
 
 def remote_setup(host: dict[str, Any], remote_dir: str, tool_root: Path) -> None:
     ssh(host, f"mkdir -p {shlex.quote(remote_dir)}")
-    for name in ("loom_hub.py", "loom_runner.py", "loom_manifest.py"):
+    for name in (
+        "loom_contract.py",
+        "loom_http.py",
+        "loom_hub.py",
+        "loom_runner.py",
+        "loom_manifest.py",
+    ):
         scp(host, tool_root / name, f"{remote_dir}/{name}")
 
 
@@ -346,11 +395,17 @@ def probe_source_capabilities(workers: list[dict[str, Any]], dispatch_specs: lis
     return report
 
 
-def start_hub(controller: dict[str, Any], remote_dir: str, port: int) -> None:
+def start_hub(controller: dict[str, Any], remote_dir: str, port: int, forwarded_env: dict[str, str]) -> None:
+    if not HUB_TOKEN:
+        raise ValueError(f"remote Hub startup requires {HUB_TOKEN_ENV} in the operator environment")
+    env_file = write_remote_env(controller, remote_dir, forwarded_env)
+    source_env = f". {shlex.quote(env_file)} || exit 1; " if env_file else ""
     cmd = (
         f"cd {shlex.quote(remote_dir)} || exit 1; "
-        f"nohup python3 loom_hub.py server --host 0.0.0.0 --port {port} "
+        f"{source_env}nohup python3 loom_hub.py server --host 0.0.0.0 --port {port} "
         f"--db hub.sqlite --artifact-root artifacts --control-log hub.jsonl "
+        f"--auth-token-env {shlex.quote(HUB_TOKEN_ENV)} "
+        f"--runner-token-env {shlex.quote(DEFAULT_DIRECT_RUNNER_TOKEN_ENV)} "
         f"< /dev/null > hub.stdout.log 2> hub.stderr.log &"
     )
     ssh(controller, cmd)
@@ -382,6 +437,10 @@ def start_local_hub(
         str(runtime_dir / "artifacts"),
         "--control-log",
         str(runtime_dir / "hub.jsonl"),
+        "--auth-token-env",
+        HUB_TOKEN_ENV,
+        "--runner-token-env",
+        DEFAULT_DIRECT_RUNNER_TOKEN_ENV,
     ]
     proc = subprocess.Popen(cmd, text=True, stdout=stdout_handle, stderr=stderr_handle)
     return {
@@ -460,8 +519,15 @@ def direct_worker_url(worker: dict[str, Any]) -> str:
     if endpoint.get("worker_url"):
         return str(endpoint["worker_url"]).rstrip("/")
     port = int(worker.get("serve_port") or endpoint.get("command_port") or 9876)
-    host = endpoint.get("public_host") or worker.get("host")
+    host = endpoint.get("private_host") or endpoint.get("public_host") or worker.get("host")
     return f"http://{host}:{port}"
+
+
+def direct_api_dispatch_mode(worker: dict[str, Any]) -> str:
+    mode = str(worker.get("direct_api_dispatch_mode") or "pull").strip().lower()
+    if mode not in {"pull", "push"}:
+        raise ValueError(f"worker {worker.get('worker_id') or worker.get('host')} has unsupported direct_api_dispatch_mode: {mode}")
+    return mode
 
 
 def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir: str, forwarded_env: dict[str, str]) -> dict[str, Any]:
@@ -470,6 +536,8 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
     if mode == "prestarted":
         return {"worker_id": worker_id, "connection_mode": mode, "started": False}
     max_concurrency = int(worker.get("max_concurrency") or worker.get("cpu") or 1)
+    initial_concurrency = int(worker.get("initial_concurrency") or 1)
+    concurrency_policy = str(worker.get("concurrency_policy") or "fixed")
     capabilities = worker.get("capabilities") or ["linux"]
     cap_args = " ".join("--capability " + shlex.quote(str(cap)) for cap in capabilities)
     env_file = write_remote_env(worker, remote_dir, forwarded_env)
@@ -478,11 +546,17 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
     for key, value in (worker.get("env") or {}).items():
         env_prefix += f"{shlex.quote(str(key))}={shlex.quote(str(value))} "
     worker_runtime_mode = "long-poll" if mode == "long-poll" else "poll"
+    direct_dispatch_mode = "pull"
     if mode == "direct-worker-api":
         worker_runtime_mode = "direct-api"
+        direct_dispatch_mode = direct_api_dispatch_mode(worker)
     claim_wait = int(worker.get("claim_wait_seconds") or (25 if worker_runtime_mode == "long-poll" else 0))
     serve_port = int(worker.get("serve_port") or endpoint_dict(worker).get("command_port") or 9876)
+    serve_host = str(worker.get("serve_host") or ("0.0.0.0" if worker_runtime_mode == "direct-api" else "127.0.0.1"))
+    direct_token_env = str(worker.get("direct_api_token_env") or DEFAULT_DIRECT_RUNNER_TOKEN_ENV)
     run_on_start = bool(worker.get("direct_api_run_on_start", True))
+    if mode == "direct-worker-api" and direct_dispatch_mode == "push":
+        run_on_start = False
     direct_start_arg = " --direct-api-run-on-start" if worker_runtime_mode == "direct-api" and run_on_start else ""
     cmd = (
         f"cd {shlex.quote(remote_dir)} || exit 1; "
@@ -492,22 +566,37 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
         f"{cap_args} "
         f"--work-dir worker-runs/{shlex.quote(worker_id)} "
         f"--max-concurrency {max_concurrency} "
-        f"--initial-concurrency 1 "
+        f"--initial-concurrency {initial_concurrency} "
+        f"--concurrency-policy {shlex.quote(concurrency_policy)} "
         f"--poll-seconds {int(worker.get('poll_seconds') or 5)} "
         f"--connection-mode {shlex.quote(worker_runtime_mode)} "
         f"--claim-wait-seconds {claim_wait} "
+        f"--controller-token-env {shlex.quote(HUB_TOKEN_ENV)} "
+        f"--serve-host {shlex.quote(serve_host)} "
         f"--serve-port {serve_port} "
+        f"--direct-api-token-env {shlex.quote(direct_token_env)} "
         f"{direct_start_arg} "
         f"< /dev/null > worker-{shlex.quote(worker_id)}.stdout.log 2> worker-{shlex.quote(worker_id)}.stderr.log &"
     )
     ssh(worker, cmd)
-    info = {"worker_id": worker_id, "connection_mode": mode, "started": True}
+    info = {
+        "worker_id": worker_id,
+        "connection_mode": mode,
+        "started": True,
+        "initial_concurrency": initial_concurrency,
+        "max_concurrency": max_concurrency,
+        "concurrency_policy": concurrency_policy,
+    }
     if mode == "direct-worker-api":
         url = direct_worker_url(worker)
-        wait_worker_api(url)
+        direct_token = token_from_env(direct_token_env)
+        if not direct_token:
+            raise ValueError(f"direct worker {worker_id} requires token environment variable: {direct_token_env}")
+        wait_worker_api(url, token=direct_token)
         info["worker_url"] = url
-        if not run_on_start:
-            request_json(url + "/api/run-loop", {"max_tasks": worker.get("max_tasks") or 0}, timeout=30)
+        info["direct_api_dispatch_mode"] = direct_dispatch_mode
+        if direct_dispatch_mode == "pull" and not run_on_start:
+            request_json(url + "/api/run-loop", {"max_tasks": worker.get("max_tasks") or 0}, timeout=30, token=direct_token)
     return info
 
 
@@ -798,12 +887,15 @@ def build_validation_assertions(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an inventory-driven Loom Matrix validation.")
+    parser.add_argument("--version", action="version", version=f"Loom Matrix Core Preview {CORE_PREVIEW_VERSION} (inventory v{INVENTORY_SCHEMA_VERSION})")
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--dispatch-spec", type=Path, action="append", required=True, help="Normalized controller dispatch JSON; repeat for ordered phases.")
     parser.add_argument("--remote-dir", default="/tmp/loom")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--forward-env", action="append", default=[], help="Forward this local environment variable to each remote worker.")
+    parser.add_argument("--hub-token-env", default=DEFAULT_HUB_TOKEN_ENV, help="Environment variable containing the Hub bearer token. It is forwarded to remote Hub and Runners when set.")
+    parser.add_argument("--runner-token-env", default=DEFAULT_RUNNER_TOKEN_ENV, help="Default environment variable containing Direct Runner API bearer tokens.")
     parser.add_argument("--operator", default="tencent-matrix")
     parser.add_argument("--skip-register-hosts", action="store_true")
     parser.add_argument("--expected-workers", type=int, default=None)
@@ -818,6 +910,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    global HUB_TOKEN, HUB_TOKEN_ENV, DEFAULT_DIRECT_RUNNER_TOKEN_ENV
+    HUB_TOKEN_ENV = args.hub_token_env
+    HUB_TOKEN = token_from_env(HUB_TOKEN_ENV)
+    DEFAULT_DIRECT_RUNNER_TOKEN_ENV = args.runner_token_env
     inventory = load_inventory(args.inventory)
     tool_root = Path(__file__).resolve().parent
     controller = inventory["controller"]
@@ -833,10 +929,19 @@ def main(argv: list[str]) -> int:
     worker_url = inventory.get("controller_worker_url") or inventory.get("controller_private_url") or public_url
     local_runtime: dict[str, Any] | None = None
     try:
+        forward_names = list(args.forward_env)
+        if HUB_TOKEN:
+            forward_names.append(HUB_TOKEN_ENV)
+        for worker in workers:
+            if connection_mode(worker) == "direct-worker-api":
+                forward_names.append(str(worker.get("direct_api_token_env") or DEFAULT_DIRECT_RUNNER_TOKEN_ENV))
+        forwarded_env = {name: os.environ[name] for name in dict.fromkeys(forward_names) if os.environ.get(name)}
         if mode == "ssh-start":
+            if not HUB_TOKEN:
+                raise ValueError(f"remote Hub startup requires {HUB_TOKEN_ENV} in the operator environment")
             wait_ssh(controller)
             remote_setup(controller, args.remote_dir, tool_root)
-            start_hub(controller, args.remote_dir, args.port)
+            start_hub(controller, args.remote_dir, args.port, forwarded_env)
         elif mode == "local-process":
             local_runtime = start_local_hub(controller, tool_root, args.output, args.port)
         for worker in workers:
@@ -862,7 +967,6 @@ def main(argv: list[str]) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         source_capability_probe = probe_source_capabilities(workers, args.dispatch_spec)
-        forwarded_env = {name: os.environ[name] for name in args.forward_env if os.environ.get(name)}
         wait_http(public_url)
         host_registration = None if args.skip_register_hosts else register_worker_hosts(public_url, inventory, args.operator)
         worker_starts = [start_worker(worker, worker_url, args.remote_dir, forwarded_env) for worker in workers]
