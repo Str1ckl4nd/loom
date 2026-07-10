@@ -180,7 +180,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--direct-worker-cidr", default=None)
     parser.add_argument("--name-prefix", default=None)
     parser.add_argument("--dispatch-spec", type=Path, action="append", required=True)
-    parser.add_argument("--remote-dir", default="/tmp/agentbenchmark-control-worker")
+    parser.add_argument("--remote-dir", default="/tmp/loom")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--forward-env", action="append", default=[])
@@ -201,8 +201,8 @@ def main(argv: list[str]) -> int:
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     tool_root = Path(__file__).resolve().parent
-    provision_script = tool_root / "tencent_cloud_provision.py"
-    matrix_script = tool_root / "tencent_cloud_matrix.py"
+    provision_script = tool_root / "loom_tencent_provision_reference.py"
+    matrix_script = tool_root / "loom_matrix.py"
     resources = args.output_dir / "resources.json"
     inventory = args.output_dir / "inventory.json"
     summary = args.output_dir / "tencent-matrix-summary.json"

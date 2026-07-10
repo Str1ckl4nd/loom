@@ -1,4 +1,4 @@
-# Task Input Manual
+# Loom Manifest
 
 This control plane does not infer benchmark cases from a target repository.
 Handoff owners or agents must normalize work into explicit campaign, case, and
@@ -104,8 +104,8 @@ unless the handoff explicitly defines why another attempt can recover.
 - `min_result_count`: minimum independently recoverable result packages.
 - `min_distinct_workers`: minimum workers represented by those results.
 
-The worker exposes the immutable runtime values `AGENTBENCHMARK_TASK_ID`,
-`AGENTBENCHMARK_ATTEMPT_NO`, and `AGENTBENCHMARK_WORKER_ID` to shell and repo
+Loom Runner exposes the immutable runtime values `LOOM_TASK_ID`,
+`LOOM_ATTEMPT_NO`, and `LOOM_WORKER_ID` to shell and repo
 commands. This allows deterministic retry-aware jobs without shared local
 marker files.
 
@@ -114,7 +114,7 @@ marker files.
 Normalize:
 
 ```bash
-python3 tools/normalize_task_manifest.py agentdojo-example.json \
+python3 tools/loom_manifest.py agentdojo-example.json \
   --operator documentation \
   --output agentdojo-example.dispatch.json
 ```
@@ -122,7 +122,7 @@ python3 tools/normalize_task_manifest.py agentdojo-example.json \
 Dispatch:
 
 ```bash
-python3 tools/control_plane_server.py dispatch-spec \
+python3 tools/loom_hub.py dispatch-spec \
   --controller http://CONTROL_HOST:8765 \
   agentdojo-example.dispatch.json
 ```

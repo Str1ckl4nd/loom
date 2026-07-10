@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""AgentBenchmark controller/control-plane prototype.
+"""Loom Hub.
 
-This is a self-contained controller for the local benchmark control/worker
-architecture. It owns task state, worker leases, result intake, scoring import,
-operator overrides, and read-only data-plane APIs. It intentionally uses only
-the Python standard library so it can run unchanged in WSL and on temporary
-Linux hosts.
+The Hub owns task state, Runner leases, result intake, scoring import, operator
+overrides, and read-only data APIs. It intentionally uses only the Python
+standard library so it can run unchanged on supplied hosts.
 """
 
 from __future__ import annotations
@@ -2107,16 +2105,16 @@ def cmd_register_worker_hosts(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="AgentBenchmark benchmark controller.")
+    parser = argparse.ArgumentParser(description="Run Loom Hub.")
     parser.add_argument("--benchmark-root", type=Path, default=Path(__file__).resolve().parents[1])
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("server")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--db", type=Path, default=Path("local-runs/control-plane/control-plane.sqlite"))
-    p.add_argument("--artifact-root", type=Path, default=Path("local-runs/control-plane/artifacts"))
-    p.add_argument("--control-log", type=Path, default=Path("local-runs/control-plane/control-plane.jsonl"))
+    p.add_argument("--db", type=Path, default=Path("loom-runs/hub/hub.sqlite"))
+    p.add_argument("--artifact-root", type=Path, default=Path("loom-runs/hub/artifacts"))
+    p.add_argument("--control-log", type=Path, default=Path("loom-runs/hub/hub.jsonl"))
     p.set_defaults(func=cmd_server)
 
     p = sub.add_parser("init-db")
@@ -2129,7 +2127,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--prefix", default="smoke-task")
     p.add_argument("--required-capability", default="linux")
     p.add_argument("--operator", default="local-smoke")
-    p.add_argument("--command", default="python3 -c \"print('agentbenchmark smoke ok')\"")
+    p.add_argument("--command", default="python3 -c \"print('loom smoke ok')\"")
     p.add_argument("--timeout-seconds", type=int, default=60)
     p.set_defaults(func=cmd_dispatch_smoke)
 

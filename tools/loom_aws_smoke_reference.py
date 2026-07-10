@@ -5,8 +5,8 @@ Automatic cloud resource creation and deletion are outside the supported
 project scope. This file is retained for historical validation and community
 reference; maintained provisioning support requires a contributor-owned PR.
 
-Creates at most two temporary EC2 Linux instances: one controller and one worker.
-It uploads the standard-library Python controller/worker, runs one task through
+Creates at most two temporary EC2 Linux instances: one Loom Hub and one Loom Runner.
+It uploads the standard-library Python Hub/Runner, runs one task through
 the private VPC path, prints the summary, and deletes all temporary resources.
 """
 
@@ -139,7 +139,7 @@ def latest_al2023_ami(args: argparse.Namespace) -> str:
 
 def create_resources(args: argparse.Namespace, root: Path, resources: dict[str, Any]) -> dict[str, Any]:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%y%m%d-%H%M%S")
-    name = f"agentbenchmark-smoke-{stamp}"
+    name = f"loom-smoke-{stamp}"
     key_name = name
     sg_name = name
     key_path = root / f"{key_name}.pem"
@@ -150,7 +150,7 @@ def create_resources(args: argparse.Namespace, root: Path, resources: dict[str, 
     restrict_private_key_acl(key_path)
     sg_id = aws(
         args,
-        ["ec2", "create-security-group", "--group-name", sg_name, "--description", "temporary AgentBenchmark smoke", "--vpc-id", vpc_id, "--query", "GroupId", "--output", "text"],
+        ["ec2", "create-security-group", "--group-name", sg_name, "--description", "temporary Loom smoke", "--vpc-id", vpc_id, "--query", "GroupId", "--output", "text"],
     )
     resources["sg_id"] = sg_id
     cidr = public_ip_cidr()
@@ -175,7 +175,7 @@ def create_resources(args: argparse.Namespace, root: Path, resources: dict[str, 
             "--instance-initiated-shutdown-behavior",
             "terminate",
             "--tag-specifications",
-            f"ResourceType=instance,Tags=[{{Key=Name,Value={name}}},{{Key=Purpose,Value=agentbenchmark-control-plane-smoke}},{{Key=DeleteAfter,Value=immediate}}]",
+            f"ResourceType=instance,Tags=[{{Key=Name,Value={name}}},{{Key=Purpose,Value=loom-hub-smoke}},{{Key=DeleteAfter,Value=immediate}}]",
         ],
         timeout=240,
     )
@@ -227,13 +227,13 @@ def run_remote_smoke(args: argparse.Namespace, resources: dict[str, Any]) -> dic
     wait_ssh(args, key, controller["public_ip"])
     wait_ssh(args, key, worker["public_ip"])
     for host in (controller["public_ip"], worker["public_ip"]):
-        scp(args, key, host, tool_root / "control_plane_server.py", "/tmp/control_plane_server.py")
-        scp(args, key, host, tool_root / "controlled_worker.py", "/tmp/controlled_worker.py")
+        scp(args, key, host, tool_root / "loom_hub.py", "/tmp/loom_hub.py")
+        scp(args, key, host, tool_root / "loom_runner.py", "/tmp/loom_runner.py")
     ssh(
         args,
         key,
         controller["public_ip"],
-        "nohup python3 /tmp/control_plane_server.py server --host 0.0.0.0 --port 8765 --db /tmp/control-plane.sqlite --artifact-root /tmp/control-plane-artifacts > /tmp/control-plane.log 2>&1 &",
+        "nohup python3 /tmp/loom_hub.py server --host 0.0.0.0 --port 8765 --db /tmp/loom-hub.sqlite --artifact-root /tmp/loom-hub-artifacts > /tmp/loom-hub.log 2>&1 &",
     )
     deadline = time.time() + 90
     while True:
@@ -256,13 +256,13 @@ def run_remote_smoke(args: argparse.Namespace, resources: dict[str, Any]) -> dic
         args,
         key,
         controller["public_ip"],
-        "python3 /tmp/control_plane_server.py dispatch-smoke --controller http://127.0.0.1:8765 --count 1 --prefix aws-smoke --required-capability linux --command " + json.dumps(command),
+        "python3 /tmp/loom_hub.py dispatch-smoke --controller http://127.0.0.1:8765 --count 1 --prefix aws-smoke --required-capability linux --command " + json.dumps(command),
     )
     worker_out = ssh(
         args,
         key,
         worker["public_ip"],
-        f"python3 /tmp/controlled_worker.py --controller http://{controller['private_ip']}:8765 --worker-id aws-worker-1 --capability linux --work-dir /tmp/agentbenchmark-worker --once --max-tasks 1",
+        f"python3 /tmp/loom_runner.py --controller http://{controller['private_ip']}:8765 --worker-id aws-worker-1 --capability linux --work-dir /tmp/loom-worker --once --max-tasks 1",
         timeout=240,
     )
     summary = remote_python_json(
@@ -273,7 +273,7 @@ def run_remote_smoke(args: argparse.Namespace, resources: dict[str, Any]) -> dic
     )
     clean = [t for t in summary.get("tasks", {}).get("tasks", []) if t.get("state") == "clean"]
     if not clean:
-        controller_log = ssh(args, key, controller["public_ip"], "cat /tmp/control-plane.log || true", timeout=60)
+        controller_log = ssh(args, key, controller["public_ip"], "cat /tmp/loom-hub.log || true", timeout=60)
         raise RuntimeError(f"AWS smoke did not produce a clean task. Worker output={worker_out}\nController log={controller_log}\nSummary={summary}")
     return {"ok": True, "controller": controller, "worker": worker, "worker_output": worker_out, "summary": summary}
 
@@ -293,7 +293,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     print(f"NOTICE: {REFERENCE_NOTICE}", file=sys.stderr)
     args = parse_args(argv)
-    root = Path(tempfile.mkdtemp(prefix="agentbenchmark-aws-smoke-")).resolve()
+    root = Path(tempfile.mkdtemp(prefix="loom-aws-smoke-")).resolve()
     resources: dict[str, Any] = {}
     try:
         resources = create_resources(args, root, resources)

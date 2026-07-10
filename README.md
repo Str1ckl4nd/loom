@@ -1,16 +1,24 @@
-# AgentBenchmark Control Worker
+# Loom
 
-Reliable, inventory-driven task delivery for agent benchmarks.
+**Leased Orchestration for Observable Model work.**
 
-AgentBenchmark Control Worker dispatches normalized benchmark jobs across
-operator-owned controller and worker hosts. The controller owns scheduling,
-leases, adaptive concurrency, retries, and result intake. Workers execute
-ordered task packages and return compact, queryable result ZIPs.
+Loom is a reliable, inventory-driven task control plane for agent evaluation.
+It dispatches normalized work across operator-owned hosts: the **Loom Hub** owns
+scheduling, leases, adaptive concurrency, retries, and result intake; **Loom
+Runners** execute ordered task packages and return compact, queryable result
+ZIPs.
 
 [Remote quick start](#remote-quick-start) |
-[Task input](docs/TASK_INPUT_MANUAL.md) |
+[Manifest](docs/TASK_MANIFEST.md) |
 [Architecture](docs/ARCHITECTURE.md) |
-[Support scope](docs/SUPPORT_SCOPE.md)
+[Support scope](docs/SCOPE.md)
+
+## The Name
+
+**Loom** is the short name for **Leased Orchestration for Observable Model
+work**. A loom brings separate threads into one ordered fabric; Loom brings task
+definitions, available hosts, leases, and evidence packages into one recoverable
+execution flow.
 
 ## What You Get
 
@@ -34,34 +42,34 @@ ordered task packages and return compact, queryable result ZIPs.
 > cloud resource creation, resizing, billing, teardown, and provider credential
 > management are intentionally unsupported and are not on the roadmap.
 
-Supply an operator-owned inventory, then use the control plane to deploy or
-connect to processes on those hosts. The retained
-`tools/tencent_cloud_provision.py`, `tools/tencent_cloud_e2e.py`, and
-`tools/aws_linux_control_plane_smoke.py` files are historical/community
+Supply an operator-owned inventory, then use Loom Hub to deploy or connect
+Loom Runners on those hosts. The retained
+`tools/loom_tencent_provision_reference.py`, `tools/loom_tencent_e2e_reference.py`, and
+`tools/loom_aws_smoke_reference.py` files are historical/community
 references, not supported interfaces. A maintained provisioning integration
 needs a contributor-owned pull request with provider-specific tests, security,
 cost, failure-recovery, and cleanup behavior.
 
-Read the complete [support scope](docs/SUPPORT_SCOPE.md) before changing the
+Read the complete [support scope](docs/SCOPE.md) before changing the
 infrastructure boundary.
 
 ## Remote Quick Start
 
 This is the supported path for dispatching work to an existing remote fleet.
-Run these commands from an operator control environment; the actual benchmark
-work runs on the hosts named in the inventory.
+Run these commands from an operator control environment; Loom Matrix coordinates
+the actual work on the hosts named in the inventory.
 
 1. Start from
-   [`examples/tencent-cloud-inventory.example.json`](examples/tencent-cloud-inventory.example.json)
+   [`examples/loom-inventory.example.json`](examples/loom-inventory.example.json)
    and replace its sample addresses, users, SSH key paths, controller URLs, and
    worker capabilities with your own existing hosts.
 2. Define the campaign as explicit case/run records. The
-   [task input manual](docs/TASK_INPUT_MANUAL.md) covers the schema, private
+   [task input manual](docs/TASK_MANIFEST.md) covers the schema, private
    source repositories, artifacts, retries, and expected outcomes.
 3. Normalize the handoff into a controller dispatch specification:
 
    ```bash
-   python3 tools/normalize_task_manifest.py campaign.json \
+   python3 tools/loom_manifest.py campaign.json \
      --operator my-team \
      --output campaign.dispatch.json
    ```
@@ -70,7 +78,7 @@ work runs on the hosts named in the inventory.
    remote results:
 
    ```bash
-   python3 tools/tencent_cloud_matrix.py \
+   python3 tools/loom_matrix.py \
      --inventory /path/to/operator-owned/inventory.json \
      --dispatch-spec campaign.dispatch.json \
      --output remote-run-summary.json
@@ -81,7 +89,7 @@ that variable available only in the operator environment. The worker uses it
 through `GIT_ASKPASS`; the token is not placed in task JSON, command logs, or
 result ZIPs.
 
-`tencent_cloud_matrix.py` deploys the control-plane scripts only. It does not
+`loom_matrix.py` deploys Loom Hub and Loom Runner scripts only. It does not
 create, resize, stop, or delete cloud resources.
 
 ## How A Run Moves
@@ -93,10 +101,10 @@ campaign manifest -> normalized dispatch spec -> controller -> workers -> result
 | Role | Owns |
 | --- | --- |
 | Operator | Existing hosts, network policy, credentials, and infrastructure lifecycle. |
-| Controller | Task dispatch, leases, state transitions, desired concurrency, result intake, audit logs, and data queries. |
-| Worker | Capability registration, heartbeats, task execution, artifact collection, and result upload. |
+| Loom Hub | Task dispatch, leases, state transitions, desired concurrency, result intake, audit logs, and data queries. |
+| Loom Runner | Capability registration, heartbeats, task execution, artifact collection, and result upload. |
 
-The controller is the single source of truth for task state. Workers report
+Loom Hub is the single source of truth for task state. Loom Runners report
 execution facts; they do not operate an independent queue.
 
 ## Connection Modes
@@ -105,9 +113,9 @@ Choose a connection mode per host in the inventory:
 
 | Mode | Use it when |
 | --- | --- |
-| `ssh-start` | SSH should bootstrap a long-lived worker, after which scheduling uses the controller HTTP API rather than a fresh SSH session for each task. |
-| `long-poll` | An idle worker should keep a claim request open briefly instead of repeatedly polling the controller. |
-| `direct-worker-api` | A worker-side HTTP endpoint should accept bootstrap commands to register or continue its pull loop. Task state still belongs to the controller. |
+| `ssh-start` | SSH should bootstrap a long-lived Loom Runner, after which scheduling uses the Hub HTTP API rather than a fresh SSH session for each task. |
+| `long-poll` | An idle Loom Runner should keep a claim request open briefly instead of repeatedly polling the Hub. |
+| `direct-worker-api` | A Runner-side HTTP endpoint should accept bootstrap commands to register or continue its pull loop. Task state still belongs to Loom Hub. |
 
 Inventory-level `ssh_control_persist` supports SSH `ControlMaster`/
 `ControlPersist` reuse during setup. See the
@@ -122,18 +130,18 @@ Every runnable task has four mandatory identifiers:
 campaign_id + case_id + setting_id + run_id
 ```
 
-The normalizer derives a stable task ID from those values. That makes an
+Loom Manifest derives a stable task ID from those values. That makes an
 individual run queryable, cancellable, retryable, and inspectable without
 disturbing adjacent work. Optional retry policies can limit retries to known
 transient categories and require the retry to land on a different capable
 worker.
 
 Repository tasks describe a source checkout, ordered commands, timeouts, and an
-explicit artifact allowlist. Workers materialize the source in a per-task
+explicit artifact allowlist. Loom Runners materialize the source in a per-task
 workspace, then upload only metadata, command logs, and requested artifacts.
 Full source checkouts are deliberately excluded from result packages.
 
-See [Task Input Manual](docs/TASK_INPUT_MANUAL.md) for the full JSON/JSONL
+See [Loom Manifest](docs/TASK_MANIFEST.md) for the full JSON/JSONL
 schema and [Architecture](docs/ARCHITECTURE.md#repo-task-delivery) for the
 delivery protocol.
 
@@ -141,20 +149,20 @@ delivery protocol.
 
 | Guide | When to read it |
 | --- | --- |
-| [Support Scope](docs/SUPPORT_SCOPE.md) | Before changing host, provider, or resource-lifecycle behavior. |
-| [Task Input Manual](docs/TASK_INPUT_MANUAL.md) | When preparing a campaign, retry policy, private source, or expected-result contract. |
+| [Loom Scope](docs/SCOPE.md) | Before changing host, provider, or resource-lifecycle behavior. |
+| [Loom Manifest](docs/TASK_MANIFEST.md) | When preparing a campaign, retry policy, private source, or expected-result contract. |
 | [AgentDojo Example](docs/AGENTDOJO_EXAMPLE.md) | When learning how a public benchmark repository can be described without turning the example into an end-to-end run. |
-| [Architecture](docs/ARCHITECTURE.md) | When integrating the controller, worker, connection modes, concurrency behavior, or result APIs. |
-| [Tencent Cloud Validation](docs/TENCENT_CLOUD_VALIDATION.md) | When validating the inventory-driven remote path on operator-supplied Tencent hosts. |
+| [Architecture](docs/ARCHITECTURE.md) | When integrating the Hub, Runner, connection modes, concurrency behavior, or result APIs. |
+| [Loom Remote Validation](docs/REMOTE_VALIDATION.md) | When validating the inventory-driven remote path on operator-supplied Tencent hosts. |
 
 ## Repository Map
 
 ```text
-tools/control_plane_server.py       # controller API, SQLite state, and CLI
-tools/controlled_worker.py          # controlled worker
-tools/normalize_task_manifest.py    # campaign/case/run normalizer
-tools/tencent_cloud_matrix.py       # inventory-driven remote runner
-examples/tencent-cloud-inventory.example.json
+tools/loom_hub.py                # Loom Hub API, SQLite state, and CLI
+tools/loom_runner.py             # Loom Runner
+tools/loom_manifest.py           # Loom Manifest normalizer
+tools/loom_matrix.py             # Loom Matrix remote runner
+examples/loom-inventory.example.json
 docs/
 ```
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""AgentBenchmark controlled worker.
+"""Loom Runner.
 
-The worker registers with the controller, heartbeats, claims tasks, runs local
-task packages, uploads a zip result package, and reports completion/failure.
-It uses only the standard library for portability across WSL and Linux EC2.
+The Runner registers with Loom Hub, heartbeats, claims tasks, runs task
+packages, uploads a ZIP result package, and reports completion or failure. It
+uses only the standard library for portability across supplied hosts.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ DEFAULT_LOCAL_COPY_IGNORES = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
-    "local-runs",
+    "loom-runs",
 }
 GNU_TIME = Path("/usr/bin/time")
 
@@ -117,7 +117,7 @@ def shell_command(payload: dict[str, Any]) -> list[str] | str:
     command = payload.get("command")
     if command:
         return command
-    return "python3 -c \"print('agentbenchmark worker noop')\""
+    return "python3 -c \"print('loom worker noop')\""
 
 
 def command_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -161,7 +161,7 @@ def run_process(
     measured_command: list[str] | str = command
     shell = isinstance(command, str)
     if sys.platform.startswith("linux") and GNU_TIME.exists():
-        fd, metric_text = tempfile.mkstemp(prefix="agentbenchmark-time-", suffix=".txt")
+        fd, metric_text = tempfile.mkstemp(prefix="loom-time-", suffix=".txt")
         os.close(fd)
         metric_path = Path(metric_text)
         measured_command = [str(GNU_TIME), "-v", "-o", str(metric_path)]
@@ -245,7 +245,7 @@ def git_auth_environment(source: dict[str, Any]) -> tuple[dict[str, str] | None,
     if not token:
         return None, None
     username = str(source.get("username") or "x-access-token")
-    fd, path_text = tempfile.mkstemp(prefix="agentbenchmark-git-askpass-")
+    fd, path_text = tempfile.mkstemp(prefix="loom-git-askpass-")
     askpass_path = Path(path_text)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("#!/bin/sh\n")
@@ -515,9 +515,9 @@ def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any
     payload = dict(task.get("payload") or {})
     payload["env"] = {
         **(payload.get("env") or {}),
-        "AGENTBENCHMARK_TASK_ID": task_id,
-        "AGENTBENCHMARK_ATTEMPT_NO": str(max(1, int(task.get("attempt_no") or 1))),
-        "AGENTBENCHMARK_WORKER_ID": str(task.get("assigned_worker_id") or ""),
+        "LOOM_TASK_ID": task_id,
+        "LOOM_ATTEMPT_NO": str(max(1, int(task.get("attempt_no") or 1))),
+        "LOOM_WORKER_ID": str(task.get("assigned_worker_id") or ""),
     }
     task_dir = work_root / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -920,11 +920,11 @@ def serve_direct_api(args: argparse.Namespace, work_root: Path) -> int:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run an AgentBenchmark controlled worker.")
+    parser = argparse.ArgumentParser(description="Run Loom Runner.")
     parser.add_argument("--controller", required=True)
     parser.add_argument("--worker-id", default=f"worker-{socket.gethostname()}-{uuid.uuid4().hex[:8]}")
     parser.add_argument("--capability", action="append", default=[])
-    parser.add_argument("--work-dir", type=Path, default=Path("local-runs/control-plane/worker"))
+    parser.add_argument("--work-dir", type=Path, default=Path("loom-runs/runner"))
     parser.add_argument("--poll-seconds", type=int, default=5)
     parser.add_argument("--lease-seconds", type=int, default=600)
     parser.add_argument("--max-concurrency", type=int, default=1, help="Hard worker-side concurrency cap. The controller chooses the active desired concurrency.")

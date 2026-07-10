@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local/WSL smoke test for the controller-worker protocol."""
+"""Local/WSL smoke test for the Loom Hub and Loom Runner protocol."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def wait_health(base: str, timeout: int = 20) -> None:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run local controller-worker smoke.")
+    parser = argparse.ArgumentParser(description="Run a local Loom Hub/Runner smoke.")
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--tasks", type=int, default=2)
     parser.add_argument("--python", default=sys.executable)
@@ -53,14 +53,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    root = Path(tempfile.mkdtemp(prefix="agentbenchmark-control-smoke-")).resolve()
+    root = Path(tempfile.mkdtemp(prefix="loom-hub-smoke-")).resolve()
     tool_root = Path(__file__).resolve().parent
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     server = subprocess.Popen(
         [
             args.python,
-            str(tool_root / "control_plane_server.py"),
+            str(tool_root / "loom_hub.py"),
             "server",
             "--host",
             "127.0.0.1",
@@ -98,7 +98,7 @@ def main(argv: list[str]) -> int:
                 subprocess.Popen(
                     [
                         args.python,
-                        str(tool_root / "controlled_worker.py"),
+                        str(tool_root / "loom_runner.py"),
                         "--controller",
                         base,
                         "--worker-id",

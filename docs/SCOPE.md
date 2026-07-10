@@ -1,14 +1,14 @@
-# Support Scope
+# Loom Scope
 
-AgentBenchmark Control Worker starts at the host boundary. Operators provide an
-inventory of controller and worker hosts; the project deploys or connects to
-processes on those hosts and manages benchmark work from there.
+Loom starts at the host boundary. Operators provide an inventory of Loom Hub and
+Loom Runner hosts; the project deploys or connects to processes on those hosts
+and manages evaluation work from there.
 
 ## Supported
 
-- inventory-driven registration of existing controller and worker hosts;
-- `ssh-start`, `long-poll`, and `direct-worker-api` worker connections;
-- remote, prestarted, or explicitly configured local controller placement;
+- inventory-driven registration of existing Loom Hub and Loom Runner hosts;
+- `ssh-start`, `long-poll`, and `direct-worker-api` Runner connections;
+- remote, prestarted, or explicitly configured local Hub placement;
 - task normalization, dispatch, leases, adaptive concurrency, retries, logs,
   result upload, querying, and recovery;
 - remote validation against hosts supplied by the operator.
@@ -26,13 +26,13 @@ project roadmap. This includes:
 
 The operator or an external infrastructure system owns those responsibilities.
 The supported cloud workflow begins after hosts exist and an `inventory.json`
-can be supplied to `tools/tencent_cloud_matrix.py` or another inventory-driven
+can be supplied to `tools/loom_matrix.py` or another inventory-driven
 runner.
 
 ## Retained Reference Helpers
 
-The existing `tools/tencent_cloud_provision.py`, `tools/tencent_cloud_e2e.py`,
-and `tools/aws_linux_control_plane_smoke.py` files are retained as historical
+The existing `tools/loom_tencent_provision_reference.py`, `tools/loom_tencent_e2e_reference.py`,
+and `tools/loom_aws_smoke_reference.py` files are retained as historical
 validation and community reference implementations. They are not supported
 interfaces, carry no compatibility or maintenance commitment, and must not be
 treated as the project's resource lifecycle layer.

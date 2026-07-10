@@ -1,4 +1,4 @@
-# Architecture
+# Loom Architecture
 
 ## Roles
 

@@ -8,7 +8,7 @@ reference; maintained provisioning support requires a contributor-owned PR.
 Creates a configurable controller plus any number of worker CVMs and writes:
 
 - `resources.json`: cloud resource IDs for cleanup.
-- `inventory.json`: input for `tools/tencent_cloud_matrix.py`.
+- `inventory.json`: input for `tools/loom_matrix.py`.
 
 It never reuses an existing running instance. Cleanup is explicit.
 """
@@ -57,7 +57,7 @@ DEFAULT_VPC_CIDR = "10.77.0.0/16"
 DEFAULT_SUBNET_CIDR = "10.77.0.0/24"
 TERMINATABLE_INSTANCE_STATES = {"RUNNING", "STOPPED"}
 SSH_BOOTSTRAP = """#!/bin/bash
-exec >>/var/log/agentbenchmark-bootstrap.log 2>&1
+exec >>/var/log/loom-bootstrap.log 2>&1
 set -x
 ssh-keygen -A
 systemctl unmask ssh.service || true
@@ -122,7 +122,7 @@ def create_security_group(args: argparse.Namespace, name: str) -> str:
         args,
         "vpc",
         "CreateSecurityGroup",
-        {"GroupName": name, "GroupDescription": "temporary AgentBenchmark Tencent matrix"},
+        {"GroupName": name, "GroupDescription": "temporary Loom Tencent matrix"},
     )
     return data["SecurityGroup"]["SecurityGroupId"]
 

@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Tencent Cloud remote matrix runner for controller/worker validation.
+"""Loom Matrix inventory-driven remote Hub/Runner validation.
 
-The script is inventory-driven: provide one controller host and five Tencent CVM
-worker hosts with different CPU/memory shapes. It deploys the standard-library
-controller and worker scripts over SSH, dispatches a normalized task spec, starts
-workers with independent hard concurrency caps, and gathers controller summary
-and control logs.
+Provide one Loom Hub host and any number of Loom Runner hosts with independent
+CPU/memory shapes. Loom Matrix deploys the standard-library Hub and Runner
+scripts over SSH, dispatches a normalized task spec, starts Runners with hard
+concurrency caps, and gathers Hub summary and control logs.
 
 This file intentionally does not create or destroy CVMs. That keeps validation
 repeatable across pre-provisioned Tencent Cloud hosts and avoids coupling the
-control-plane test to one cloud-account provisioning policy.
+Loom Matrix to one cloud-account provisioning policy.
 """
 
 from __future__ import annotations
@@ -68,7 +67,7 @@ def ssh_base(host: dict[str, Any]) -> list[str]:
     ]
     control_persist = host.get("ssh_control_persist") or connection_dict(host).get("ssh_control_persist")
     if control_persist:
-        cmd.extend(["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/agentbenchmark-%C", "-o", f"ControlPersist={control_persist}"])
+        cmd.extend(["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/loom-%C", "-o", f"ControlPersist={control_persist}"])
     if host.get("key_path"):
         cmd.extend(["-i", str(host["key_path"])])
     if host.get("port"):
@@ -102,7 +101,7 @@ def scp(host: dict[str, Any], local: Path, remote: str, *, timeout: int = 120) -
     cmd = ["scp", "-o", "StrictHostKeyChecking=accept-new"]
     control_persist = host.get("ssh_control_persist") or connection_dict(host).get("ssh_control_persist")
     if control_persist:
-        cmd.extend(["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/agentbenchmark-%C", "-o", f"ControlPersist={control_persist}"])
+        cmd.extend(["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/loom-%C", "-o", f"ControlPersist={control_persist}"])
     if host.get("key_path"):
         cmd.extend(["-i", str(host["key_path"])])
     if host.get("port"):
@@ -218,7 +217,7 @@ def load_inventory(path: Path) -> dict[str, Any]:
 
 def remote_setup(host: dict[str, Any], remote_dir: str, tool_root: Path) -> None:
     ssh(host, f"mkdir -p {shlex.quote(remote_dir)}")
-    for name in ("control_plane_server.py", "controlled_worker.py", "normalize_task_manifest.py"):
+    for name in ("loom_hub.py", "loom_runner.py", "loom_manifest.py"):
         scp(host, tool_root / name, f"{remote_dir}/{name}")
 
 
@@ -347,53 +346,53 @@ def probe_source_capabilities(workers: list[dict[str, Any]], dispatch_specs: lis
     return report
 
 
-def start_controller(controller: dict[str, Any], remote_dir: str, port: int) -> None:
+def start_hub(controller: dict[str, Any], remote_dir: str, port: int) -> None:
     cmd = (
         f"cd {shlex.quote(remote_dir)} || exit 1; "
-        f"nohup python3 control_plane_server.py server --host 0.0.0.0 --port {port} "
-        f"--db control-plane.sqlite --artifact-root artifacts --control-log control-plane.jsonl "
-        f"< /dev/null > control-plane.stdout.log 2> control-plane.stderr.log &"
+        f"nohup python3 loom_hub.py server --host 0.0.0.0 --port {port} "
+        f"--db hub.sqlite --artifact-root artifacts --control-log hub.jsonl "
+        f"< /dev/null > hub.stdout.log 2> hub.stderr.log &"
     )
     ssh(controller, cmd)
 
 
-def start_local_controller(
+def start_local_hub(
     controller: dict[str, Any],
     tool_root: Path,
     output: Path,
     port: int,
 ) -> dict[str, Any]:
-    runtime_dir = output.parent / "local-controller"
+    runtime_dir = output.parent / "local-hub"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    stdout_path = runtime_dir / "control-plane.stdout.log"
-    stderr_path = runtime_dir / "control-plane.stderr.log"
+    stdout_path = runtime_dir / "hub.stdout.log"
+    stderr_path = runtime_dir / "hub.stderr.log"
     stdout_handle = stdout_path.open("w", encoding="utf-8")
     stderr_handle = stderr_path.open("w", encoding="utf-8")
     cmd = [
         sys.executable,
-        str(tool_root / "control_plane_server.py"),
+        str(tool_root / "loom_hub.py"),
         "server",
         "--host",
         str(controller.get("bind_host") or "127.0.0.1"),
         "--port",
         str(port),
         "--db",
-        str(runtime_dir / "control-plane.sqlite"),
+        str(runtime_dir / "hub.sqlite"),
         "--artifact-root",
         str(runtime_dir / "artifacts"),
         "--control-log",
-        str(runtime_dir / "control-plane.jsonl"),
+        str(runtime_dir / "hub.jsonl"),
     ]
     proc = subprocess.Popen(cmd, text=True, stdout=stdout_handle, stderr=stderr_handle)
     return {
         "process": proc,
         "stdout_handle": stdout_handle,
         "stderr_handle": stderr_handle,
-        "control_log": runtime_dir / "control-plane.jsonl",
+        "control_log": runtime_dir / "hub.jsonl",
     }
 
 
-def stop_local_controller(runtime: dict[str, Any] | None) -> None:
+def stop_local_hub(runtime: dict[str, Any] | None) -> None:
     if not runtime:
         return
     proc = runtime["process"]
@@ -487,7 +486,7 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
     direct_start_arg = " --direct-api-run-on-start" if worker_runtime_mode == "direct-api" and run_on_start else ""
     cmd = (
         f"cd {shlex.quote(remote_dir)} || exit 1; "
-        f"{source_env}{env_prefix}nohup python3 controlled_worker.py "
+        f"{source_env}{env_prefix}nohup python3 loom_runner.py "
         f"--controller {shlex.quote(controller_private_url)} "
         f"--worker-id {shlex.quote(worker_id)} "
         f"{cap_args} "
@@ -654,12 +653,12 @@ def gather(
     output.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if controller_mode(controller) == "ssh-start":
         try:
-            log = ssh(controller, f"tail -n 500 {shlex.quote(remote_dir)}/control-plane.jsonl || true", timeout=60, check=False)
-            (output.parent / "control-plane.tail.jsonl").write_text(log, encoding="utf-8")
+            log = ssh(controller, f"tail -n 500 {shlex.quote(remote_dir)}/hub.jsonl || true", timeout=60, check=False)
+            (output.parent / "loom-hub.tail.jsonl").write_text(log, encoding="utf-8")
         except Exception:
             pass
     elif local_runtime and Path(local_runtime["control_log"]).exists():
-        (output.parent / "control-plane.tail.jsonl").write_text(
+        (output.parent / "loom-hub.tail.jsonl").write_text(
             Path(local_runtime["control_log"]).read_text(encoding="utf-8", errors="replace"),
             encoding="utf-8",
         )
@@ -798,10 +797,10 @@ def build_validation_assertions(
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run an inventory-driven Tencent Cloud controller/worker validation.")
+    parser = argparse.ArgumentParser(description="Run an inventory-driven Loom Matrix validation.")
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--dispatch-spec", type=Path, action="append", required=True, help="Normalized controller dispatch JSON; repeat for ordered phases.")
-    parser.add_argument("--remote-dir", default="/tmp/agentbenchmark-control-worker")
+    parser.add_argument("--remote-dir", default="/tmp/loom")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--forward-env", action="append", default=[], help="Forward this local environment variable to each remote worker.")
@@ -837,9 +836,9 @@ def main(argv: list[str]) -> int:
         if mode == "ssh-start":
             wait_ssh(controller)
             remote_setup(controller, args.remote_dir, tool_root)
-            start_controller(controller, args.remote_dir, args.port)
+            start_hub(controller, args.remote_dir, args.port)
         elif mode == "local-process":
-            local_runtime = start_local_controller(controller, tool_root, args.output, args.port)
+            local_runtime = start_local_hub(controller, tool_root, args.output, args.port)
         for worker in workers:
             if connection_mode(worker) in SSH_STARTED_MODES and not worker.get("predeployed"):
                 wait_ssh(worker)
@@ -931,7 +930,7 @@ def main(argv: list[str]) -> int:
         )
         return 0 if assertions["ok"] else 1
     finally:
-        stop_local_controller(local_runtime)
+        stop_local_hub(local_runtime)
 
 
 if __name__ == "__main__":

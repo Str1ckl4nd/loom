@@ -1,7 +1,7 @@
 # AgentDojo Example
 
 This is a documentation-only example of describing a public AgentDojo checkout
-as an AgentBenchmark Control Worker repository task. It is designed to make the
+as a Loom repository task. It is designed to make the
 task shape concrete for readers, not to validate AgentDojo end to end.
 
 The example intentionally does not install AgentDojo, invoke its benchmark
@@ -62,7 +62,7 @@ agentdojo-documentation__agentdojo-source-layout__documentation__run-001
 
 ## Reading The Example
 
-`source` tells a controlled worker which public repository and ref to
+`source` tells a Loom Runner which public repository and ref to
 materialize. The `source-github-com` capability lets the scheduler avoid
 dispatching the task to a worker that cannot reach GitHub.
 
@@ -73,14 +73,14 @@ commands with an owned, explicit run plan and declare the resulting artifacts,
 timeouts, retry policy, and expected outcome.
 
 The `artifact_paths` allowlist causes only `agentdojo-source-check.json` and
-worker/controller metadata to be retained in the result ZIP. The checkout is
+Runner/Hub metadata to be retained in the result ZIP. The checkout is
 not uploaded.
 
 ## From Documentation To A Real Campaign
 
-Use the [Task Input Manual](TASK_INPUT_MANUAL.md) to normalize a real manifest
+Use [Loom Manifest](TASK_MANIFEST.md) to normalize a real manifest
 and the [Architecture guide](ARCHITECTURE.md#repo-task-delivery) to understand
 source materialization, retries, and result recovery. Any live work should use
 operator-supplied remote hosts as described in the
-[Support Scope](SUPPORT_SCOPE.md); this document does not prescribe or trigger
+[Loom Scope](SCOPE.md); this document does not prescribe or trigger
 an end-to-end run.

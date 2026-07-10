@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build deterministic cloud-only concurrency and failure validation inputs."""
+"""Build deterministic Loom Matrix concurrency and failure validation inputs."""
 
 from __future__ import annotations
 
@@ -89,13 +89,13 @@ def calibration_campaign(profiles: list[tuple[str, int]], cpu_seconds: float) ->
                     "expected": {"state": "clean"},
                 }
             )
-    return {"campaign_id": "tencent-concurrency-calibration", "cases": cases}
+    return {"campaign_id": "loom-concurrency-calibration", "cases": cases}
 
 
 def failure_command(category: str, message: str) -> str:
     if category == "rate_limited":
         return (
-            "if [ \"${AGENTBENCHMARK_ATTEMPT_NO:-1}\" -ge 2 ]; then echo recovered-after-rate-limit; exit 0; "
+            "if [ \"${LOOM_ATTEMPT_NO:-1}\" -ge 2 ]; then echo recovered-after-rate-limit; exit 0; "
             f"else echo {json.dumps(message)} >&2; exit 1; fi"
         )
     return f"echo {json.dumps(message)} >&2; exit 1"
@@ -129,7 +129,7 @@ def failure_campaign(profiles: list[tuple[str, int]]) -> tuple[dict[str, Any], s
         )
         if category == "rate_limited":
             retry_task_id = (
-                f"tencent-failure-injection__{case_id}__known-failure-classification__run-{run_id}"
+                f"loom-failure-injection__{case_id}__known-failure-classification__run-{run_id}"
             )
     cases.append(
         {
@@ -139,8 +139,8 @@ def failure_campaign(profiles: list[tuple[str, int]]) -> tuple[dict[str, Any], s
             "runner": "shell",
             "required_capability": "linux",
             "command": (
-                "if [ \"${AGENTBENCHMARK_ATTEMPT_NO:-1}\" -ge 2 ]; then "
-                "echo recovered-on-${AGENTBENCHMARK_WORKER_ID}; exit 0; "
+                "if [ \"${LOOM_ATTEMPT_NO:-1}\" -ge 2 ]; then "
+                "echo recovered-on-${LOOM_WORKER_ID}; exit 0; "
                 "else echo 'connection timed out: synthetic first-attempt source failure' >&2; exit 1; fi"
             ),
             "timeout_seconds": 60,
@@ -157,7 +157,7 @@ def failure_campaign(profiles: list[tuple[str, int]]) -> tuple[dict[str, Any], s
             },
         }
     )
-    return {"campaign_id": "tencent-failure-injection", "cases": cases}, retry_task_id
+    return {"campaign_id": "loom-failure-injection", "cases": cases}, retry_task_id
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -166,7 +166,7 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build Tencent Cloud controller/worker validation campaign inputs.")
+    parser = argparse.ArgumentParser(description="Build Loom Matrix validation campaign inputs.")
     parser.add_argument("--profile", type=parse_profile, action="append", default=[])
     parser.add_argument("--cpu-seconds", type=float, default=0.25)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -196,7 +196,7 @@ def main(argv: list[str]) -> int:
         "required_log_categories": [category for category, _message in FAILURES] + ["automatic_retry"],
         "retry_task_id": retry_task_id,
         "automatic_cross_worker_retry_task_id": (
-            f"tencent-failure-injection__{AUTO_FAILOVER_CASE_ID}__automatic-cross-worker-retry__run-001"
+            f"loom-failure-injection__{AUTO_FAILOVER_CASE_ID}__automatic-cross-worker-retry__run-001"
         ),
         "calibration_task_count": len(calibration["cases"]),
         "failure_task_count": len(failures["cases"]),

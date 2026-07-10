@@ -1,28 +1,28 @@
-# Tencent Cloud Validation
+# Loom Remote Validation
 
-Use this path for remote validation. Do not use GitHub Actions for benchmark
+Use Loom Matrix for remote validation. Do not use GitHub Actions for evaluation
 tests.
 
 ## Support Boundary
 
 This project supports validation on existing, operator-supplied hosts. The
 supported entry point is an `inventory.json` passed to
-`tools/tencent_cloud_matrix.py`.
+`tools/loom_matrix.py`.
 
 Creating or deleting CVMs, VPCs, subnets, security groups, cloud SSH keys, and
 other provider resources is explicitly out of scope and is not planned. The
 operator owns cloud credentials, host selection, billing, and teardown. The
 retained provisioning scripts are historical/community references only; anyone
 who needs maintained resource lifecycle support should submit and own a pull
-request. See `SUPPORT_SCOPE.md`.
+request. See `SCOPE.md`.
 
 ## Purpose
 
-The matrix validates that these dimensions are decoupled:
+Loom Matrix validates that these dimensions are decoupled:
 
 - worker count: any positive number of Tencent CVM hosts can join or leave
   independently; this validation deliberately uses five.
-- controller location: controller URL is a config value and may be local, remote,
+- Hub location: the controller URL is a config value and may be local, remote,
   public, or private.
 - worker internal concurrency: each worker advertises a hard cap, while the
   controller owns `desired_concurrency`.
@@ -43,7 +43,7 @@ run):
 | `tc-4c8g` | `S6.LARGE8` | medium throughput |
 | `tc-8c16g` | `SA5.2XLARGE16` | high ceiling / over-theory probe |
 
-Copy `examples/tencent-cloud-inventory.example.json`, replace hosts, users, key
+Copy `examples/loom-inventory.example.json`, replace hosts, users, key
 paths, and private controller URL.
 
 Each worker may choose a connection mode:
@@ -69,7 +69,7 @@ The controller chooses one independent mode in the inventory:
 
 ## Retained Resource Lifecycle References
 
-`tools/tencent_cloud_provision.py` and `tools/tencent_cloud_e2e.py` remain in the
+`tools/loom_tencent_provision_reference.py` and `tools/loom_tencent_e2e_reference.py` remain in the
 repository to preserve the original 2026 validation path. They are unsupported
 reference implementations, not recommended setup commands or stable project
 interfaces. Their provider assumptions, pricing choices, permissions, and
@@ -84,7 +84,7 @@ a maintained feature require a contributor-owned pull request.
 Normalize a campaign:
 
 ```bash
-python3 tools/normalize_task_manifest.py campaign.json \
+python3 tools/loom_manifest.py campaign.json \
   --operator remote-operator \
   --output campaign.dispatch.json
 ```
@@ -92,13 +92,13 @@ python3 tools/normalize_task_manifest.py campaign.json \
 Start the Tencent matrix:
 
 ```bash
-python3 tools/tencent_cloud_matrix.py \
+python3 tools/loom_matrix.py \
   --inventory /path/to/operator-owned/inventory.json \
   --dispatch-spec campaign.dispatch.json \
   --output tencent-matrix-summary.json
 ```
 
-`tencent_cloud_matrix.py` deploys only the control-plane scripts. It does not
+`loom_matrix.py` deploys only Loom Hub and Loom Runner scripts. It does not
 create, resize, or destroy CVMs. That inventory-driven boundary is the supported
 contract.
 
@@ -115,12 +115,12 @@ with six known failure classes plus a cross-worker retry probe. The
 remote validation phase and is deliberately excluded from this matrix.
 
 ```bash
-RUN_DIR=.cloud-runs/agentbenchmark-matrix-$(date +%Y%m%d%H%M%S)
+RUN_DIR=.cloud-runs/loom-matrix-$(date +%Y%m%d%H%M%S)
 mkdir -p "$RUN_DIR"
-python3 tools/build_cloud_validation_campaigns.py --output-dir "$RUN_DIR"
-python3 tools/normalize_task_manifest.py "$RUN_DIR/concurrency-calibration.json" \
+python3 tools/loom_validation_campaigns.py --output-dir "$RUN_DIR"
+python3 tools/loom_manifest.py "$RUN_DIR/concurrency-calibration.json" \
   --operator tencent-e2e --output "$RUN_DIR/concurrency-calibration.dispatch.json"
-python3 tools/normalize_task_manifest.py "$RUN_DIR/failure-injection.json" \
+python3 tools/loom_manifest.py "$RUN_DIR/failure-injection.json" \
   --operator tencent-e2e --output "$RUN_DIR/failure-injection.dispatch.json"
 ```
 
@@ -128,7 +128,7 @@ Run all phases against an operator-owned inventory:
 
 ```bash
 INVENTORY=/path/to/operator-owned/inventory.json
-python3 tools/tencent_cloud_matrix.py \
+python3 tools/loom_matrix.py \
   --inventory "$INVENTORY" \
   --dispatch-spec "$RUN_DIR/concurrency-calibration.dispatch.json" \
   --dispatch-spec "$RUN_DIR/failure-injection.dispatch.json" \
@@ -141,7 +141,7 @@ python3 tools/tencent_cloud_matrix.py \
   --require-log-category network_unavailable \
   --require-log-category run_error \
   --require-log-category automatic_retry \
-  --retry-task-id tencent-failure-injection__failure-rate_limited__known-failure-classification__run-003 \
+  --retry-task-id loom-failure-injection__failure-rate_limited__known-failure-classification__run-003 \
   --timeout-seconds 3600 \
   --output "$RUN_DIR/tencent-matrix-summary.json"
 ```
@@ -184,8 +184,8 @@ Unhealthy runs reduce concurrency and write `warning` logs. Known issue classes:
 After the run, inspect:
 
 - `tencent-matrix-summary.json`: workers, tasks, results, control log.
-- `control-plane.tail.jsonl`: controller JSONL log from the remote host.
-- controller artifacts under `/tmp/agentbenchmark-control-worker/artifacts`.
+- `loom-hub.tail.jsonl`: Loom Hub JSONL log from the remote host.
+- controller artifacts under `/tmp/loom/artifacts`.
 
 Completion evidence must show:
 
@@ -200,7 +200,7 @@ Completion evidence must show:
 ## Verified Remote Run
 
 The 2026-07-10 Tencent run in
-`.cloud-runs/agentbenchmark-matrix-20260710044602/` used five workers
+`.cloud-runs/loom-matrix-20260710044602/` used five workers
 (`SA2.MEDIUM2`, `SA3.MEDIUM4`, `SA2.MEDIUM8`, `S6.LARGE8`, and
 `SA5.2XLARGE16`) across `long-poll`, `ssh-start`, and `direct-worker-api` modes.
 It used the now-unsupported lifecycle reference helper; that historical choice

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remote-friendly smoke test for repo-backed tasks.
+"""Remote-friendly Loom Hub/Runner smoke test for repo-backed tasks.
 
 This starts a controller and one worker, dispatches a repo runner task, and
 checks that the worker cloned/materialized the source, ran the command, uploaded
@@ -49,7 +49,7 @@ def wait_health(base: str, timeout: int = 20) -> None:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run controller-worker repo task smoke.")
+    parser = argparse.ArgumentParser(description="Run a Loom Hub/Runner repo task smoke.")
     parser.add_argument("--source-repo", required=True)
     parser.add_argument("--source-ref", default=None)
     parser.add_argument("--source-depth", type=int, default=1)
@@ -70,14 +70,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    root = Path(tempfile.mkdtemp(prefix="agentbenchmark-repo-smoke-")).resolve()
+    root = Path(tempfile.mkdtemp(prefix="loom-repo-smoke-")).resolve()
     tool_root = Path(__file__).resolve().parent
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     server = subprocess.Popen(
         [
             args.python,
-            str(tool_root / "control_plane_server.py"),
+            str(tool_root / "loom_hub.py"),
             "server",
             "--host",
             "127.0.0.1",
@@ -118,7 +118,7 @@ def main(argv: list[str]) -> int:
         worker = subprocess.Popen(
             [
                 args.python,
-                str(tool_root / "controlled_worker.py"),
+                str(tool_root / "loom_runner.py"),
                 "--controller",
                 base,
                 "--worker-id",
