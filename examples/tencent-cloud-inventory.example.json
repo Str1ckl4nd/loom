@@ -1,0 +1,83 @@
+{
+  "connection_defaults": {
+    "ssh_control_persist": "10m"
+  },
+  "controller": {
+    "connection_mode": "ssh-start",
+    "host": "203.0.113.10",
+    "private_host": "10.0.0.10",
+    "user": "ubuntu",
+    "key_path": "~/.ssh/tencent-cloud.pem"
+  },
+  "controller_public_url": "http://203.0.113.10:8765",
+  "controller_worker_url": "http://10.0.0.10:8765",
+  "controller_private_url": "http://10.0.0.10:8765",
+  "workers": [
+    {
+      "worker_id": "tc-2c2g",
+      "host": "203.0.113.11",
+      "private_host": "10.0.0.11",
+      "user": "ubuntu",
+      "key_path": "~/.ssh/tencent-cloud.pem",
+      "connection_mode": "long-poll",
+      "instance_type": "SA2.MEDIUM2",
+      "cpu": 2,
+      "memory_gb": 2,
+      "max_concurrency": 16,
+      "capabilities": ["linux", "tencent", "small"]
+    },
+    {
+      "worker_id": "tc-2c4g",
+      "host": "203.0.113.12",
+      "private_host": "10.0.0.12",
+      "user": "ubuntu",
+      "key_path": "~/.ssh/tencent-cloud.pem",
+      "connection_mode": "ssh-start",
+      "instance_type": "SA3.MEDIUM4",
+      "cpu": 2,
+      "memory_gb": 4,
+      "max_concurrency": 32,
+      "capabilities": ["linux", "tencent", "medium"]
+    },
+    {
+      "worker_id": "tc-2c8g",
+      "host": "203.0.113.13",
+      "private_host": "10.0.0.13",
+      "user": "ubuntu",
+      "key_path": "~/.ssh/tencent-cloud.pem",
+      "connection_mode": "long-poll",
+      "instance_type": "SA2.MEDIUM8",
+      "cpu": 2,
+      "memory_gb": 8,
+      "max_concurrency": 48,
+      "capabilities": ["linux", "tencent", "memory"]
+    },
+    {
+      "worker_id": "tc-4c8g",
+      "host": "203.0.113.14",
+      "private_host": "10.0.0.14",
+      "user": "ubuntu",
+      "key_path": "~/.ssh/tencent-cloud.pem",
+      "connection_mode": "direct-worker-api",
+      "command_port": 9876,
+      "instance_type": "S6.LARGE8",
+      "cpu": 4,
+      "memory_gb": 8,
+      "max_concurrency": 96,
+      "capabilities": ["linux", "tencent", "large"]
+    },
+    {
+      "worker_id": "tc-8c16g",
+      "host": "203.0.113.15",
+      "private_host": "10.0.0.15",
+      "user": "ubuntu",
+      "key_path": "~/.ssh/tencent-cloud.pem",
+      "connection_mode": "long-poll",
+      "instance_type": "SA5.2XLARGE16",
+      "cpu": 8,
+      "memory_gb": 16,
+      "max_concurrency": 160,
+      "capabilities": ["linux", "tencent", "xlarge"]
+    }
+  ]
+}
