@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -57,6 +58,7 @@ class DirectPushTests(unittest.TestCase):
             fail_fast=True,
             connection_mode="direct-api",
             concurrency_policy="fixed",
+            resource_capacity={"cpu_millis": 1000, "memory_mb": 1024, "disk_mb": 4096, "gpu_count": 0},
             claim_wait_seconds=0,
             serve_host="127.0.0.1",
             serve_port=0,
@@ -170,6 +172,48 @@ class DirectPushTests(unittest.TestCase):
         self.assertEqual(rows[0]["lease_worker_id"], self.runner_args.worker_id)
         results = request_json(self.controller + "/api/data/new-results?cursor=0", token=self.hub_token)["results"]
         self.assertEqual([row["task_id"] for row in results], [task_id])
+
+    def test_direct_push_rejects_a_second_task_when_reservation_is_full(self) -> None:
+        first_id = "direct-resource__case-a__setting-a__run-001"
+        second_id = "direct-resource__case-b__setting-a__run-001"
+        profile = {"placement": "shared", "resources": {"cpu_millis": 100, "memory_mb": 600}}
+        request_json(
+            self.controller + "/api/tasks/dispatch",
+            {
+                "schema_version": 1,
+                "operator": "test",
+                "tasks": [
+                    {
+                        "task_id": first_id,
+                        "required_capability": "linux",
+                        "payload": {
+                            "runner": "shell",
+                            "command": "python3 -c \"import time; time.sleep(1)\"",
+                            "execution_profile": profile,
+                        },
+                    },
+                    {
+                        "task_id": second_id,
+                        "required_capability": "linux",
+                        "payload": {"runner": "noop", "execution_profile": profile},
+                    },
+                ],
+            },
+            token=self.hub_token,
+        )
+        request_json(
+            self.controller + "/api/admin/push-task",
+            {"task_id": first_id, "worker_id": self.runner_args.worker_id, "operator": "test"},
+            token=self.hub_token,
+        )
+        with self.assertRaises(HTTPError) as unavailable:
+            request_json(
+                self.controller + "/api/admin/push-task",
+                {"task_id": second_id, "worker_id": self.runner_args.worker_id, "operator": "test"},
+                token=self.hub_token,
+            )
+        self.assertEqual(unavailable.exception.code, 409)
+        self.assertEqual(json.loads(unavailable.exception.read().decode("utf-8"))["error"], "worker_resource_unavailable")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ and manages evaluation work from there.
 - remote, prestarted, or explicitly configured local Hub placement;
 - task normalization, dispatch, leases, fixed/adaptive concurrency policies, retries, logs,
   result upload, querying, and recovery;
+- scheduler-level shared-host resource reservations and exclusive placement;
 - remote validation against hosts supplied by the operator, including the
   process-level cleanup performed by `loom_agentdojo_remote_smoke.py`.
 
@@ -31,6 +32,10 @@ can be supplied to `tools/loom_matrix.py` or another inventory-driven
 runner. Loom's remote smoke helper stops only the Hub and Runner processes it
 started; explicit VM stop/delete and billing verification remain an operator
 workflow step.
+
+Resource admission is not containerization, cgroup enforcement, or a security
+isolation guarantee. Operators who need those boundaries must provide them on
+their existing hosts or through a separate infrastructure system.
 
 ## Retained Reference Helpers
 

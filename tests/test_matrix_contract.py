@@ -29,6 +29,7 @@ class MatrixContractTests(unittest.TestCase):
                     "max_concurrency": 4,
                     "initial_concurrency": 3,
                     "concurrency_policy": "fixed",
+                    "resource_capacity": {"cpu_millis": 4000, "memory_mb": 8192},
                     "capabilities": ["linux"],
                 },
                 "http://10.0.0.1:8765",
@@ -43,10 +44,13 @@ class MatrixContractTests(unittest.TestCase):
         self.assertEqual(result["initial_concurrency"], 3)
         self.assertEqual(result["max_concurrency"], 4)
         self.assertEqual(result["concurrency_policy"], "fixed")
+        self.assertEqual(result["resource_capacity"], {"cpu_millis": 4000, "memory_mb": 8192})
         self.assertEqual(len(commands), 1)
         self.assertIn("--max-concurrency 4", commands[0])
         self.assertIn("--initial-concurrency 3", commands[0])
         self.assertIn("--concurrency-policy fixed", commands[0])
+        self.assertIn("--resource-capacity-json", commands[0])
+        self.assertIn('"cpu_millis":4000', commands[0])
         self.assertIn("--controller-token-env TEST_HUB_TOKEN", commands[0])
 
 

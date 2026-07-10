@@ -34,6 +34,7 @@ from urllib.request import Request, urlopen
 
 from loom_contract import CONCURRENCY_POLICIES, CORE_PREVIEW_VERSION, RUNNER_API_VERSION, metadata
 from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, bearer_headers, is_loopback_host, token_from_env, token_matches
+from loom_resources import normalize_capacity, normalize_capacity_overrides
 
 
 DEFAULT_LOCAL_COPY_IGNORES = {
@@ -47,7 +48,7 @@ DEFAULT_LOCAL_COPY_IGNORES = {
 GNU_TIME = Path("/usr/bin/time")
 
 
-def resource_snapshot() -> dict[str, Any]:
+def resource_snapshot(path: Path | None = None) -> dict[str, Any]:
     cpu_count = os.cpu_count() or 1
     mem_total_mb = 0.0
     mem_available_mb = 0.0
@@ -63,12 +64,27 @@ def resource_snapshot() -> dict[str, Any]:
                 values[key] = float(parts[0]) / 1024.0
         mem_total_mb = values.get("MemTotal", 0.0)
         mem_available_mb = values.get("MemAvailable", 0.0)
+    disk_total_mb = 0.0
+    disk_available_mb = 0.0
+    try:
+        disk = shutil.disk_usage(path or Path.cwd())
+        disk_total_mb = disk.total / (1024.0 * 1024.0)
+        disk_available_mb = disk.free / (1024.0 * 1024.0)
+    except OSError:
+        pass
     return {
         "cpu_count": cpu_count,
         "mem_total_mb": round(mem_total_mb, 2),
         "mem_available_mb": round(mem_available_mb, 2),
+        "disk_total_mb": round(disk_total_mb, 2),
+        "disk_available_mb": round(disk_available_mb, 2),
         "loadavg": os.getloadavg() if hasattr(os, "getloadavg") else None,
     }
+
+
+def configured_resource_capacity(args: argparse.Namespace, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = getattr(args, "resource_capacity", None)
+    return normalize_capacity(raw, snapshot=snapshot or resource_snapshot(getattr(args, "work_dir", None)))
 
 
 def child_usage() -> resource.struct_rusage:
@@ -663,6 +679,7 @@ def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any
         "controller_concurrency": task.get("controller_concurrency") or {},
         "resource_capacity": resource_snapshot(),
         "resource_usage": measured_usage,
+        "resource_admission": task.get("resource_admission") or {},
     }
     if runner == "repo":
         result["repo_result_path"] = "stdout.txt"
@@ -750,6 +767,7 @@ def heartbeat(args: argparse.Namespace, current_runs: list[dict[str, Any]], phas
 
 
 def register(args: argparse.Namespace) -> dict[str, Any]:
+    snapshot = resource_snapshot(getattr(args, "work_dir", None))
     return request_json(
         args.controller,
         "/api/workers/register",
@@ -759,8 +777,9 @@ def register(args: argparse.Namespace) -> dict[str, Any]:
             "max_concurrency": args.max_concurrency,
             "initial_concurrency": args.initial_concurrency,
             "concurrency_policy": args.concurrency_policy,
+            "resource_capacity": configured_resource_capacity(args, snapshot),
             "runner_api_version": RUNNER_API_VERSION,
-            "health": {"hostname": socket.gethostname(), "platform": platform.platform(), "resources": resource_snapshot()},
+            "health": {"hostname": socket.gethostname(), "platform": platform.platform(), "resources": snapshot},
         },
         token=controller_token(args),
     )
@@ -1013,6 +1032,7 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
                     "active_pushes": self._active_pushes(),
                     "last_result": self.server.last_result,
                     "resources": resource_snapshot(),
+                    "resource_capacity": configured_resource_capacity(self.server.worker_args),
                 },
             )
             return
@@ -1027,6 +1047,7 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
                     "concurrency_policy": self.server.worker_args.concurrency_policy,
                     "initial_concurrency": self.server.worker_args.initial_concurrency,
                     "max_concurrency": self.server.worker_args.max_concurrency,
+                    "resource_capacity": configured_resource_capacity(self.server.worker_args),
                 },
             )
             return
@@ -1191,6 +1212,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-concurrency", type=int, default=1, help="Hard worker-side concurrency cap. The controller chooses the active desired concurrency.")
     parser.add_argument("--initial-concurrency", type=int, default=1, help="Initial desired concurrency reported to the controller.")
     parser.add_argument("--concurrency-policy", choices=sorted(CONCURRENCY_POLICIES), default="fixed", help="fixed keeps the configured level except explicit resource/rate-limit backoff; adaptive probes upward and backoff levels.")
+    parser.add_argument("--resource-capacity-json", default=None, help="Optional scheduler capacity JSON. Omitted fields use the Runner's observed host capacity.")
     parser.add_argument("--max-tasks", type=int, default=0, help="0 means unlimited until --once exits on idle.")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
@@ -1207,10 +1229,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.capability = ["linux" if os.name != "nt" else "windows", "*"]
     args.max_concurrency = int(args.max_concurrency)
     args.initial_concurrency = int(args.initial_concurrency)
+    if args.resource_capacity_json:
+        try:
+            args.resource_capacity = json.loads(args.resource_capacity_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("resource_capacity_json must be a JSON object") from exc
+        if not isinstance(args.resource_capacity, dict):
+            raise ValueError("resource_capacity_json must be a JSON object")
+    else:
+        args.resource_capacity = {}
     if args.max_concurrency < 1:
         raise ValueError("max_concurrency must be positive")
     if args.initial_concurrency < 1 or args.initial_concurrency > args.max_concurrency:
         raise ValueError("initial_concurrency must satisfy 1 <= initial_concurrency <= max_concurrency")
+    args.resource_capacity = normalize_capacity_overrides(args.resource_capacity)
+    normalize_capacity(args.resource_capacity, snapshot=resource_snapshot())
     if args.connection_mode == "long-poll" and args.claim_wait_seconds <= 0:
         args.claim_wait_seconds = 25
     if args.connection_mode == "poll":

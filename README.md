@@ -32,6 +32,9 @@ execution flow.
   case, setting, and run instead of handing a worker an ambiguous instruction.
 - **Controller-owned scheduling.** Workers advertise a hard capacity, while the
   controller controls leases, desired concurrency, retries, and recovery.
+- **Resource-aware shared-host admission.** A task can reserve CPU, memory,
+  disk, and accelerators before it is leased, while `shared` and `exclusive`
+  placement make host multiplexing explicit instead of accidental.
 - **Frozen Core Preview v1 contracts.** Versioned inventory, manifest, dispatch,
   token, CLI, and capability-query contracts keep downstream automation on a
   documented surface rather than internal Python helpers.
@@ -168,6 +171,7 @@ delivery protocol.
 | --- | --- |
 | [Loom Scope](docs/SCOPE.md) | Before changing host, provider, or resource-lifecycle behavior. |
 | [Loom Manifest](docs/TASK_MANIFEST.md) | When preparing a campaign, retry policy, private source, or expected-result contract. |
+| [Resource Admission](docs/RESOURCE_ADMISSION.md) | When sharing existing workers safely with declared task resource requests. |
 | [Release Contract](docs/RELEASE_CONTRACT.md) | When changing phases, Direct Runner delivery, authentication, result retention, or release gates. |
 | [AgentDojo Release Fixture](docs/AGENTDOJO_EXAMPLE.md) | When running or inspecting the fixed 2-case x 2-run x 2-attempt remote regression. |
 | [Architecture](docs/ARCHITECTURE.md) | When integrating the Hub, Runner, connection modes, concurrency behavior, or result APIs. |

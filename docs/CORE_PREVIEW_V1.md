@@ -84,6 +84,19 @@ is an enforced Runner and Hub cap, not a tuning hint.
 The Runner also clamps every Hub instruction to its own hard maximum. An invalid
 initial value fails registration instead of being silently altered.
 
+## Resource Admission
+
+The v1 manifest may add an `execution_profile` containing `placement` and
+resource requests. Inventory may add worker `resource_capacity` overrides.
+Loom treats both as scheduler contracts: leases reserve the declared CPU,
+memory, disk, and GPU values against the Runner's reported capacity. It does
+not turn those values into an operating-system isolation boundary.
+
+`GET /api/data/worker-capacity` reports capacity, reservations, and available
+headroom. `GET /api/data/task-admission?task_id=...` explains a task's current
+eligibility per worker. The `worker-capacity` and `task-admission` Hub CLI
+subcommands expose the same authenticated views.
+
 ## Token And Startup Contract
 
 The stable environment-variable names are `LOOM_HUB_TOKEN` and

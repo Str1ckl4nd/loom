@@ -26,6 +26,8 @@ def metadata(service: str) -> dict[str, Any]:
             "leases",
             "fixed-concurrency",
             "adaptive-concurrency",
+            "resource-reservations-v1",
+            "shared-host-placement",
             "direct-runner-push",
             "attempt-result-retention",
         ],
@@ -35,7 +37,10 @@ def metadata(service: str) -> dict[str, Any]:
             "repo-phases-v1",
             "lease-renewal",
             "artifact-sha256",
+            "resource-capacity-reporting",
+            "shared-host-placement",
             "direct-runner-push",
+            "resource-capacity-forwarding",
             "fixed-concurrency",
             "adaptive-concurrency",
         ],
@@ -53,6 +58,7 @@ def metadata(service: str) -> dict[str, Any]:
             "case-run-selection",
             "repo-phases-v1",
             "retry-contract",
+            "execution-profile-v1",
         ],
     }
     api_version = HUB_API_VERSION if service == "hub" else RUNNER_API_VERSION if service == "runner" else None

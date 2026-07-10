@@ -88,6 +88,32 @@ Legacy `commands` remain supported when `phases` is absent. New manifests should
 use phases so the prepare, evaluate, and collection contract is visible to the
 controller, operator, and result consumer.
 
+## Execution Profile
+
+`execution_profile` declares scheduler placement and a resource reservation.
+It may appear in `defaults`, a case/run record, or `payload`; case values merge
+over defaults by resource field.
+
+```json
+{
+  "execution_profile": {
+    "placement": "shared",
+    "resources": {
+      "cpu_millis": 750,
+      "memory_mb": 1536,
+      "disk_mb": 2048,
+      "gpu_count": 0
+    }
+  }
+}
+```
+
+`placement` is `shared` by default. `exclusive` reserves a worker until the
+attempt leaves its active lease state. Resource fields are scheduler admission
+requests, not OS-level limits or a claim of security isolation. See [Resource
+Admission](RESOURCE_ADMISSION.md) for inventory capacity, GPU type constraints,
+and inspection commands.
+
 ## Parameters And Runtime Injection
 
 The normalizer expands `{campaign_id}`, `{case_id}`, `{setting_id}`, `{run_id}`

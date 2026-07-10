@@ -55,6 +55,13 @@ In both modes, long work renews its Hub lease while it runs. A failed delivery
 whose outcome is unknown remains leased until normal recovery, rather than
 being blindly dispatched twice.
 
+Worker `resource_capacity` and task `execution_profile` are part of the same
+lease admission decision. Hub atomically reserves declared CPU, memory, disk,
+and accelerator values for `leased` and `running` tasks. `shared` placement may
+share a worker within those reservations; `exclusive` placement requires an
+otherwise idle worker. This is scheduler-level admission only, not a sandbox or
+OS-level resource guarantee.
+
 ## Authentication And Network Boundary
 
 Hub defaults to `127.0.0.1`. Binding it outside loopback requires a bearer token

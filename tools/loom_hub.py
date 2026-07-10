@@ -24,7 +24,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from loom_contract import (
     CONCURRENCY_POLICIES,
@@ -37,6 +37,14 @@ from loom_contract import (
     RUNNER_API_VERSION,
 )
 from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, is_loopback_host, request_json as http_request_json, token_from_env, token_matches
+from loom_resources import (
+    add_resources,
+    normalize_capacity,
+    normalize_capacity_overrides,
+    normalize_execution_profile,
+    remaining_resources,
+    resource_shortfalls,
+)
 
 
 CASE_ROW = re.compile(r"^\|\s*(C\d+)\s*\|\s*`?([^`|]+)`?\s*\|\s*`?([^`|]+)`?\s*\|\s*`?([^`|]+)`?\s*\|")
@@ -184,6 +192,7 @@ def register_host_rows(conn: sqlite3.Connection, hosts: list[dict[str, Any]], op
         concurrency_policy = str(host.get("concurrency_policy") or "fixed").strip().lower()
         if concurrency_policy not in CONCURRENCY_POLICIES:
             raise ValueError(f"host {host_id} has unsupported concurrency_policy: {concurrency_policy}")
+        resource_capacity = normalize_capacity_overrides(host.get("resource_capacity"))
         endpoint = host_endpoint(host)
         ssh_config = host_ssh_config(host)
         labels = dict(host.get("labels") or {})
@@ -192,14 +201,16 @@ def register_host_rows(conn: sqlite3.Connection, hosts: list[dict[str, Any]], op
                 labels.setdefault(key, host[key])
         labels.setdefault("initial_concurrency", initial_concurrency)
         labels.setdefault("concurrency_policy", concurrency_policy)
+        if resource_capacity:
+            labels.setdefault("resource_capacity", resource_capacity)
         conn.execute(
             """
             INSERT INTO worker_hosts(
               host_id, worker_id, connection_mode, state, capabilities_json,
-              max_concurrency, initial_concurrency, concurrency_policy, endpoint_json, ssh_json, labels_json,
+              max_concurrency, initial_concurrency, concurrency_policy, resource_capacity_json, endpoint_json, ssh_json, labels_json,
               registered_by, created_at, last_seen_at, updated_at
             )
-            VALUES (?, ?, ?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id) DO UPDATE SET
               worker_id=excluded.worker_id,
               connection_mode=excluded.connection_mode,
@@ -208,6 +219,7 @@ def register_host_rows(conn: sqlite3.Connection, hosts: list[dict[str, Any]], op
               max_concurrency=excluded.max_concurrency,
               initial_concurrency=excluded.initial_concurrency,
               concurrency_policy=excluded.concurrency_policy,
+              resource_capacity_json=excluded.resource_capacity_json,
               endpoint_json=excluded.endpoint_json,
               ssh_json=excluded.ssh_json,
               labels_json=excluded.labels_json,
@@ -223,6 +235,7 @@ def register_host_rows(conn: sqlite3.Connection, hosts: list[dict[str, Any]], op
                 max_concurrency,
                 initial_concurrency,
                 concurrency_policy,
+                json.dumps(resource_capacity, ensure_ascii=False),
                 json.dumps(endpoint, ensure_ascii=False),
                 json.dumps(ssh_config, ensure_ascii=False),
                 json.dumps(labels, ensure_ascii=False),
@@ -240,6 +253,7 @@ def register_host_rows(conn: sqlite3.Connection, hosts: list[dict[str, Any]], op
                 "max_concurrency": max_concurrency,
                 "initial_concurrency": initial_concurrency,
                 "concurrency_policy": concurrency_policy,
+                "resource_capacity": resource_capacity,
                 "capabilities": capabilities,
                 "endpoint": endpoint,
             }
@@ -316,6 +330,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           active_runs_json TEXT NOT NULL DEFAULT '[]',
           health_json TEXT NOT NULL DEFAULT '{}',
           resource_json TEXT NOT NULL DEFAULT '{}',
+          resource_capacity_json TEXT NOT NULL DEFAULT '{}',
           tuning_json TEXT NOT NULL DEFAULT '{}',
           desired_concurrency INTEGER NOT NULL DEFAULT 1,
           registered_at TEXT NOT NULL,
@@ -378,6 +393,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           max_concurrency INTEGER NOT NULL DEFAULT 1,
           initial_concurrency INTEGER NOT NULL DEFAULT 1,
           concurrency_policy TEXT NOT NULL DEFAULT 'fixed',
+          resource_capacity_json TEXT NOT NULL DEFAULT '{}',
           endpoint_json TEXT NOT NULL DEFAULT '{}',
           ssh_json TEXT NOT NULL DEFAULT '{}',
           labels_json TEXT NOT NULL DEFAULT '{}',
@@ -429,12 +445,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_column(conn, "workers", "resource_json", "TEXT NOT NULL DEFAULT '{}'")
+    ensure_column(conn, "workers", "resource_capacity_json", "TEXT NOT NULL DEFAULT '{}'")
     ensure_column(conn, "workers", "tuning_json", "TEXT NOT NULL DEFAULT '{}'")
     ensure_column(conn, "workers", "desired_concurrency", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "workers", "initial_concurrency", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "workers", "concurrency_policy", "TEXT NOT NULL DEFAULT 'fixed'")
     ensure_column(conn, "worker_hosts", "initial_concurrency", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "worker_hosts", "concurrency_policy", "TEXT NOT NULL DEFAULT 'fixed'")
+    ensure_column(conn, "worker_hosts", "resource_capacity_json", "TEXT NOT NULL DEFAULT '{}'")
     ensure_column(conn, "tasks", "run_id", "TEXT")
     ensure_column(conn, "tasks", "setting_id", "TEXT")
     ensure_column(conn, "tasks", "excluded_worker_ids_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -578,6 +596,107 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        parsed = json.loads(value or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def task_execution_profile(task: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    payload = json_object(task["payload_json"] if "payload_json" in task.keys() else task.get("payload"))
+    return normalize_execution_profile(payload.get("execution_profile"))
+
+
+def worker_resource_capacity(worker: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    capacity_raw = worker["resource_capacity_json"] if "resource_capacity_json" in worker.keys() else worker.get("resource_capacity")
+    resource_raw = worker["resource_json"] if "resource_json" in worker.keys() else worker.get("resources")
+    return normalize_capacity(json_object(capacity_raw), snapshot=json_object(resource_raw))
+
+
+def worker_concurrency_state(
+    conn: sqlite3.Connection,
+    worker: sqlite3.Row | dict[str, Any],
+    *,
+    leased_active: int | None = None,
+) -> dict[str, int]:
+    """Treat Hub leases as active even before the next Runner heartbeat."""
+    worker_id = str(worker["worker_id"])
+    active_raw = worker["active_runs_json"] if "active_runs_json" in worker.keys() else worker.get("active_runs")
+    try:
+        reported_runs = json.loads(active_raw or "[]")
+    except (json.JSONDecodeError, TypeError):
+        reported_runs = []
+    reported_active = len(reported_runs) if isinstance(reported_runs, list) else 0
+    if leased_active is None:
+        leased_active = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE lease_worker_id=? AND state IN ('leased','running')",
+                (worker_id,),
+            ).fetchone()[0]
+        )
+    max_concurrency = max(1, int(worker["max_concurrency"] or 1))
+    desired_concurrency = max(1, min(int(worker["desired_concurrency"] or 1), max_concurrency))
+    return {
+        "reported_active": reported_active,
+        "leased_active": leased_active,
+        "active_count": max(reported_active, leased_active),
+        "desired_concurrency": desired_concurrency,
+        "max_concurrency": max_concurrency,
+        "effective_limit": min(desired_concurrency, max_concurrency),
+    }
+
+
+def worker_reservation_state(conn: sqlite3.Connection, worker_id: str) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT task_id,payload_json FROM tasks WHERE lease_worker_id=? AND state IN ('leased','running') ORDER BY updated_at,task_id",
+        (worker_id,),
+    ).fetchall()
+    profiles = [task_execution_profile(row) for row in rows]
+    return {
+        "task_ids": [str(row["task_id"]) for row in rows],
+        "reserved": add_resources(*(profile["resources"] for profile in profiles)),
+        "exclusive_active": any(profile["placement"] == "exclusive" for profile in profiles),
+    }
+
+
+def worker_resource_admission(conn: sqlite3.Connection, worker: sqlite3.Row, task: sqlite3.Row) -> dict[str, Any]:
+    profile = task_execution_profile(task)
+    capacity = worker_resource_capacity(worker)
+    reservation = worker_reservation_state(conn, str(worker["worker_id"]))
+    concurrency = worker_concurrency_state(conn, worker, leased_active=len(reservation["task_ids"]))
+    reserved = reservation["reserved"]
+    requested = profile["resources"]
+    shortfalls = resource_shortfalls(capacity, reserved, requested)
+    reason: str | None = None
+    if profile["placement"] == "exclusive" and reservation["task_ids"]:
+        reason = "exclusive_worker_busy"
+    elif reservation["exclusive_active"]:
+        reason = "worker_has_exclusive_task"
+    elif shortfalls:
+        reason = "resource_reservation_unavailable"
+    elif concurrency["active_count"] >= concurrency["effective_limit"]:
+        reason = "worker_concurrency_reached"
+    projected = add_resources(reserved, requested)
+    return {
+        "ok": reason is None,
+        "reason": reason,
+        "placement": profile["placement"],
+        "requested": requested,
+        "capacity": capacity,
+        "reserved_before": reserved,
+        "available_before": remaining_resources(capacity, reserved),
+        "available_after": remaining_resources(capacity, projected),
+        "shortfalls": shortfalls,
+        "active_task_ids": reservation["task_ids"],
+        "exclusive_active": reservation["exclusive_active"],
+        "concurrency": concurrency,
+    }
 
 
 def automatic_retry_policy(task: sqlite3.Row) -> dict[str, Any]:
@@ -1215,6 +1334,62 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                 self._json(200, {"workers": rows, "cutoff": cutoff})
                 return
+            if path == "/api/data/worker-capacity":
+                with self._db() as conn:
+                    rows = conn.execute(
+                        "SELECT * FROM workers WHERE blocked=0 ORDER BY worker_id"
+                    ).fetchall()
+                    workers = []
+                    for worker in rows:
+                        capacity = worker_resource_capacity(worker)
+                        reservation = worker_reservation_state(conn, str(worker["worker_id"]))
+                        workers.append(
+                            {
+                                "worker_id": worker["worker_id"],
+                                "status": worker["status"],
+                                "capacity": capacity,
+                                "reserved": reservation["reserved"],
+                                "available": remaining_resources(capacity, reservation["reserved"]),
+                                "active_task_ids": reservation["task_ids"],
+                                "exclusive_active": reservation["exclusive_active"],
+                                "max_concurrency": int(worker["max_concurrency"] or 1),
+                                "desired_concurrency": int(worker["desired_concurrency"] or 1),
+                            }
+                        )
+                self._json(200, {"workers": workers})
+                return
+            if path == "/api/data/task-admission":
+                task_id = str(qs.get("task_id", [""])[0]).strip()
+                if not task_id:
+                    self._json(400, {"error": "task_id_required"})
+                    return
+                with self._db() as conn:
+                    task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                    if task is None:
+                        self._json(404, {"error": "task_not_found", "task_id": task_id})
+                        return
+                    candidates = []
+                    for worker in conn.execute("SELECT * FROM workers ORDER BY worker_id"):
+                        worker_id = str(worker["worker_id"])
+                        if int(worker["blocked"] or 0):
+                            candidates.append({"worker_id": worker_id, "ok": False, "reason": "worker_blocked"})
+                            continue
+                        capabilities = json.loads(worker["capabilities_json"] or "[]")
+                        if not worker_can_run(task, capabilities, worker_id):
+                            candidates.append({"worker_id": worker_id, "ok": False, "reason": "worker_not_eligible"})
+                            continue
+                        admission = worker_resource_admission(conn, worker, task)
+                        candidates.append({"worker_id": worker_id, **admission})
+                self._json(
+                    200,
+                    {
+                        "task_id": task_id,
+                        "execution_profile": task_execution_profile(task),
+                        "eligible_worker_count": sum(1 for candidate in candidates if candidate["ok"]),
+                        "workers": candidates,
+                    },
+                )
+                return
             if path == "/api/data/running-tasks":
                 with self._db() as conn:
                     rows = [
@@ -1421,6 +1596,9 @@ class Handler(BaseHTTPRequestHandler):
                 components = spec.get("components") or (case_components(self.server.benchmark_root, case) if case else {})
                 task_payload = dict(payload.get("payload") or {})
                 task_payload.update(spec.get("payload") or {})
+                execution_profile = spec.get("execution_profile", task_payload.get("execution_profile"))
+                if execution_profile is not None:
+                    task_payload["execution_profile"] = normalize_execution_profile(execution_profile)
                 normalized = task_payload.get("normalized") if isinstance(task_payload.get("normalized"), dict) else {}
                 run_id = spec.get("run_id") or normalized.get("run_id")
                 setting_id = spec.get("setting_id") or normalized.get("setting_id")
@@ -1520,6 +1698,12 @@ class Handler(BaseHTTPRequestHandler):
         if concurrency_policy not in CONCURRENCY_POLICIES:
             self._json(400, {"error": "unsupported_concurrency_policy", "allowed": sorted(CONCURRENCY_POLICIES)})
             return
+        health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+        try:
+            resource_capacity = normalize_capacity(payload.get("resource_capacity"), snapshot=json_object(health.get("resources")))
+        except ValueError as exc:
+            self._json(400, {"error": "invalid_resource_capacity", "detail": str(exc)})
+            return
         desired_concurrency = initial_concurrency
         now = utc_now()
         with self._db() as conn:
@@ -1527,9 +1711,9 @@ class Handler(BaseHTTPRequestHandler):
                 """
                 INSERT INTO workers(
                   worker_id, status, capabilities_json, max_concurrency, initial_concurrency, concurrency_policy, desired_concurrency,
-                  registered_at, last_seen_at, updated_at, health_json, resource_json, tuning_json
+                  registered_at, last_seen_at, updated_at, health_json, resource_json, resource_capacity_json, tuning_json
                 )
-                VALUES (?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(worker_id) DO UPDATE SET
                   status='registered',
                   capabilities_json=excluded.capabilities_json,
@@ -1541,6 +1725,7 @@ class Handler(BaseHTTPRequestHandler):
                   updated_at=excluded.updated_at,
                   health_json=excluded.health_json,
                   resource_json=excluded.resource_json,
+                  resource_capacity_json=excluded.resource_capacity_json,
                   tuning_json=excluded.tuning_json
                 """,
                 (
@@ -1553,13 +1738,15 @@ class Handler(BaseHTTPRequestHandler):
                     now,
                     now,
                     now,
-                    json.dumps(payload.get("health") or {}, ensure_ascii=False),
-                    json.dumps((payload.get("health") or {}).get("resources") or {}, ensure_ascii=False),
+                    json.dumps(health, ensure_ascii=False),
+                    json.dumps(health.get("resources") or {}, ensure_ascii=False),
+                    json.dumps(resource_capacity, ensure_ascii=False),
                     json.dumps(
                         {
                             "concurrency_policy": concurrency_policy,
                             "initial_concurrency": initial_concurrency,
                             "current_concurrency": desired_concurrency,
+                            "resource_capacity": resource_capacity,
                             "updated_at": now,
                         },
                         ensure_ascii=False,
@@ -1580,6 +1767,7 @@ class Handler(BaseHTTPRequestHandler):
                     "desired_concurrency": desired_concurrency,
                     "max_concurrency": max_concurrency,
                     "concurrency_policy": concurrency_policy,
+                    "resource_capacity": resource_capacity,
                 },
             )
             conn.commit()
@@ -1592,6 +1780,7 @@ class Handler(BaseHTTPRequestHandler):
                 "desired_concurrency": desired_concurrency,
                 "max_concurrency": max_concurrency,
                 "concurrency_policy": concurrency_policy,
+                "resource_capacity": resource_capacity,
             },
         )
 
@@ -1620,7 +1809,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             log_worker_event(conn, worker_id, "heartbeat", payload)
             worker = conn.execute(
-                "SELECT initial_concurrency,concurrency_policy,desired_concurrency,max_concurrency FROM workers WHERE worker_id=?",
+                "SELECT initial_concurrency,concurrency_policy,desired_concurrency,max_concurrency,resource_capacity_json FROM workers WHERE worker_id=?",
                 (worker_id,),
             ).fetchone()
             conn.commit()
@@ -1634,6 +1823,7 @@ class Handler(BaseHTTPRequestHandler):
                 "desired_concurrency": int(worker["desired_concurrency"] or 1) if worker else 1,
                 "max_concurrency": int(worker["max_concurrency"] or 1) if worker else 1,
                 "concurrency_policy": str(worker["concurrency_policy"] or "fixed") if worker else "fixed",
+                "resource_capacity": json_object(worker["resource_capacity_json"]) if worker else {},
             },
         )
 
@@ -1653,12 +1843,13 @@ class Handler(BaseHTTPRequestHandler):
                 conn.rollback()
                 return 403, {"error": "worker_not_available"}
             capabilities = json.loads(worker["capabilities_json"] or "[]")
-            active_count = len(json.loads(worker["active_runs_json"] or "[]"))
-            max_concurrency = max(1, int(worker["max_concurrency"] or 1))
+            concurrency = worker_concurrency_state(conn, worker)
+            active_count = concurrency["active_count"]
+            max_concurrency = concurrency["max_concurrency"]
             initial_concurrency = max(1, min(int(worker["initial_concurrency"] or 1), max_concurrency))
             concurrency_policy = str(worker["concurrency_policy"] or "fixed")
-            desired_concurrency = max(1, min(int(worker["desired_concurrency"] or 1), max_concurrency))
-            controller_limit = max(0, min(desired_concurrency, max_concurrency) - active_count)
+            desired_concurrency = concurrency["desired_concurrency"]
+            controller_limit = max(0, concurrency["effective_limit"] - active_count)
             limit = min(limit, controller_limit)
             if limit <= 0:
                 conn.commit()
@@ -1682,6 +1873,9 @@ class Handler(BaseHTTPRequestHandler):
                 if len(claimed) >= limit:
                     break
                 if not worker_can_run(task, capabilities, worker_id):
+                    continue
+                resource_admission = worker_resource_admission(conn, worker, task)
+                if not resource_admission["ok"]:
                     continue
                 conn.execute(
                     """
@@ -1712,6 +1906,7 @@ class Handler(BaseHTTPRequestHandler):
                             "initial_concurrency": initial_concurrency,
                             "concurrency_policy": concurrency_policy,
                             "active_count_at_claim": active_count,
+                            "resource_admission": resource_admission,
                         },
                     }
                 )
@@ -1726,6 +1921,8 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
             conn.commit()
+            reservation = worker_reservation_state(conn, worker_id)
+            capacity = worker_resource_capacity(worker)
         return 200, {
             "tasks": claimed,
             "desired_concurrency": desired_concurrency,
@@ -1733,6 +1930,9 @@ class Handler(BaseHTTPRequestHandler):
             "initial_concurrency": initial_concurrency,
             "concurrency_policy": concurrency_policy,
             "active_count": active_count,
+            "resource_capacity": capacity,
+            "reserved_resources": reservation["reserved"],
+            "available_resources": remaining_resources(capacity, reservation["reserved"]),
         }
 
     def _claim_task(self) -> None:
@@ -1774,29 +1974,32 @@ class Handler(BaseHTTPRequestHandler):
             if not worker_can_run(task, capabilities, worker_id):
                 conn.rollback()
                 return 409, {"error": "worker_not_eligible", "task_id": task_id, "worker_id": worker_id}
-            desired_concurrency = max(1, int(worker["desired_concurrency"] or 1))
-            max_concurrency = max(1, int(worker["max_concurrency"] or 1))
+            resource_admission = worker_resource_admission(conn, worker, task)
+            if not resource_admission["ok"]:
+                conn.commit()
+                if resource_admission["reason"] == "worker_concurrency_reached":
+                    concurrency = resource_admission["concurrency"]
+                    return 429, {
+                        "error": "worker_capacity_reached",
+                        "worker_id": worker_id,
+                        "active_count": concurrency["active_count"],
+                        "desired_concurrency": concurrency["desired_concurrency"],
+                        "max_concurrency": concurrency["max_concurrency"],
+                        "initial_concurrency": max(1, min(int(worker["initial_concurrency"] or 1), concurrency["max_concurrency"])),
+                        "concurrency_policy": str(worker["concurrency_policy"] or "fixed"),
+                    }
+                return 409, {
+                    "error": "worker_resource_unavailable",
+                    "task_id": task_id,
+                    "worker_id": worker_id,
+                    "admission": resource_admission,
+                }
+            concurrency = resource_admission["concurrency"]
+            desired_concurrency = concurrency["desired_concurrency"]
+            max_concurrency = concurrency["max_concurrency"]
             initial_concurrency = max(1, min(int(worker["initial_concurrency"] or 1), max_concurrency))
             concurrency_policy = str(worker["concurrency_policy"] or "fixed")
-            reported_active = len(json.loads(worker["active_runs_json"] or "[]"))
-            leased_active = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE lease_worker_id=? AND state IN ('leased','running')",
-                    (worker_id,),
-                ).fetchone()[0]
-            )
-            active_count = max(reported_active, leased_active)
-            if active_count >= min(desired_concurrency, max_concurrency):
-                conn.commit()
-                return 429, {
-                    "error": "worker_capacity_reached",
-                    "worker_id": worker_id,
-                    "active_count": active_count,
-                    "desired_concurrency": desired_concurrency,
-                    "max_concurrency": max_concurrency,
-                    "initial_concurrency": initial_concurrency,
-                    "concurrency_policy": concurrency_policy,
-                }
+            active_count = concurrency["active_count"]
             now = utc_now()
             conn.execute(
                 """
@@ -1838,6 +2041,7 @@ class Handler(BaseHTTPRequestHandler):
                 "concurrency_policy": concurrency_policy,
                 "active_count_at_claim": active_count,
                 "dispatch_mode": "direct-push",
+                "resource_admission": resource_admission,
             },
             "controller_push": {"push_id": push_id, "leased_at": now},
         }
@@ -2477,6 +2681,16 @@ def cmd_dispatch_repo_run(args: argparse.Namespace) -> int:
         "materialize_timeout_seconds": args.materialize_timeout_seconds,
         "env": parse_key_value(args.env),
         "continue_on_error": args.continue_on_error,
+        "execution_profile": {
+            "placement": args.placement,
+            "resources": {
+                "cpu_millis": args.cpu_millis,
+                "memory_mb": args.memory_mb,
+                "disk_mb": args.disk_mb,
+                "gpu_count": args.gpu_count,
+                "gpu_types": args.gpu_type,
+            },
+        },
     }
     task_id = args.task_id or "repo-run-" + str(uuid.uuid4())
     task = {
@@ -2519,12 +2733,26 @@ def cmd_summary(args: argparse.Namespace) -> int:
         "health": request_json(base + "/api/healthz", token=controller_token(args)),
         "worker_hosts": request_json(base + "/api/data/worker-hosts", token=controller_token(args)),
         "workers": request_json(base + "/api/data/active-workers", token=controller_token(args)),
+        "worker_capacity": request_json(base + "/api/data/worker-capacity", token=controller_token(args)),
         "tasks": request_json(base + "/api/tasks?limit=200", token=controller_token(args)),
         "results": request_json(base + f"/api/data/new-results?cursor={args.cursor}&limit=200", token=controller_token(args)),
         "error_rate": request_json(base + "/api/data/error-rate?by=state&window_seconds=86400", token=controller_token(args)),
         "control_log": request_json(base + "/api/data/control-log?limit=100", token=controller_token(args)),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_worker_capacity(args: argparse.Namespace) -> int:
+    out = request_json(args.controller.rstrip("/") + "/api/data/worker-capacity", token=controller_token(args))
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_task_admission(args: argparse.Namespace) -> int:
+    query = urlencode({"task_id": args.task_id})
+    out = request_json(args.controller.rstrip("/") + "/api/data/task-admission?" + query, token=controller_token(args))
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2632,6 +2860,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--timeout-seconds", type=int, default=300)
     p.add_argument("--materialize-timeout-seconds", type=int, default=600)
     p.add_argument("--continue-on-error", action="store_true")
+    p.add_argument("--placement", choices=["shared", "exclusive"], default="shared", help="Scheduler placement only; exclusive reserves the worker until this attempt finishes.")
+    p.add_argument("--cpu-millis", type=int, default=0)
+    p.add_argument("--memory-mb", type=int, default=0)
+    p.add_argument("--disk-mb", type=int, default=0)
+    p.add_argument("--gpu-count", type=int, default=0)
+    p.add_argument("--gpu-type", action="append", default=[])
     add_controller_auth_arg(p)
     p.set_defaults(func=cmd_dispatch_repo_run)
 
@@ -2647,6 +2881,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--cursor", type=int, default=0)
     add_controller_auth_arg(p)
     p.set_defaults(func=cmd_summary)
+
+    p = sub.add_parser("worker-capacity")
+    p.add_argument("--controller", default="http://127.0.0.1:8765")
+    add_controller_auth_arg(p)
+    p.set_defaults(func=cmd_worker_capacity)
+
+    p = sub.add_parser("task-admission")
+    p.add_argument("--controller", default="http://127.0.0.1:8765")
+    p.add_argument("--task-id", required=True)
+    add_controller_auth_arg(p)
+    p.set_defaults(func=cmd_task_admission)
 
     p = sub.add_parser("capabilities")
     p.add_argument("--controller", default="http://127.0.0.1:8765")

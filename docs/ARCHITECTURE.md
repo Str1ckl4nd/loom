@@ -96,6 +96,26 @@ declared `initial_concurrency`, and neither can exceed `max_concurrency`.
 The Runner independently clamps Hub responses to its own maximum. This makes
 the maximum a hard safety boundary even if a controller is misconfigured.
 
+### Resource Admission
+
+Concurrency is a count ceiling; it does not say whether two tasks can fit in
+the same host's CPU, memory, disk, or accelerator budget. Workers may report a
+`resource_capacity`, and tasks may declare an `execution_profile` with a
+resource request and `shared` or `exclusive` placement.
+
+Hub computes active reservations from its own `leased` and `running` rows while
+it holds the same transaction that creates a lease. Both pull and Direct Push
+must satisfy:
+
+```text
+reserved + requested <= resource_capacity
+```
+
+`exclusive` requires no active lease and prevents further leases until its task
+becomes non-active. This is a scheduling reservation, not a container, cgroup,
+or security boundary. [Resource Admission](RESOURCE_ADMISSION.md) defines the
+public fields and inspection APIs.
+
 ## Repo Task Delivery
 
 The V1 repository contract is phase-oriented:

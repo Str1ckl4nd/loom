@@ -65,12 +65,12 @@
         {
           "path": "agentdojo-artifact-index.json",
           "bytes": 299,
-          "sha256": "fcd47bbab232c6cadae90d6b82e9da7969250ffed158394ff39229445b410520"
+          "sha256": "23ec41c85481ff25326d88b804e83450571a84fae73a3facb4ffca3594637092"
         },
         {
           "path": "loom-agentdojo-output/workspace-user-task-0/001/local/workspace/user_task_0/none/none.json",
           "bytes": 1648,
-          "sha256": "91816250483ddf859d5246163957403bf29263e340c4f8213a3fb849d8b3dba0"
+          "sha256": "a3f7a96d91eda579ccb5f80dfc92498a504fe5d40fac6fe59f4b56439732a7b2"
         }
       ],
       "agentdojo_output": {
@@ -81,7 +81,7 @@
           {
             "path": "workspace-user-task-0/001/local/workspace/user_task_0/none/none.json",
             "bytes": 1648,
-            "sha256": "91816250483ddf859d5246163957403bf29263e340c4f8213a3fb849d8b3dba0"
+            "sha256": "a3f7a96d91eda579ccb5f80dfc92498a504fe5d40fac6fe59f4b56439732a7b2"
           }
         ]
       }
@@ -133,12 +133,12 @@
         {
           "path": "agentdojo-artifact-index.json",
           "bytes": 299,
-          "sha256": "6d96d92637c3de00954c372cdbe7ca1609d4b1af5e0432d2684fada3cb8372f3"
+          "sha256": "83b7434c081d0521b85b0a131321269616723f9f2a2eccc70b9ad0a4d54180a3"
         },
         {
           "path": "loom-agentdojo-output/workspace-user-task-0/002/local/workspace/user_task_0/none/none.json",
-          "bytes": 1646,
-          "sha256": "9b3f023ba2ce06425796ad035c28a5259f3a40272205c71d260634efd581e9ec"
+          "bytes": 1648,
+          "sha256": "0a809b48e1486ebbac309ac42424af5385a4f9ffce66e9a48b9366d63b91376d"
         }
       ],
       "agentdojo_output": {
@@ -148,8 +148,8 @@
         "files": [
           {
             "path": "workspace-user-task-0/002/local/workspace/user_task_0/none/none.json",
-            "bytes": 1646,
-            "sha256": "9b3f023ba2ce06425796ad035c28a5259f3a40272205c71d260634efd581e9ec"
+            "bytes": 1648,
+            "sha256": "0a809b48e1486ebbac309ac42424af5385a4f9ffce66e9a48b9366d63b91376d"
           }
         ]
       }
@@ -201,12 +201,12 @@
         {
           "path": "agentdojo-artifact-index.json",
           "bytes": 299,
-          "sha256": "8def199095d948d9b85284e74e942f6f341518ff80b45226ffb57293e41b3233"
+          "sha256": "f1dc22659ff5662c8055a458af62ef27ee10fb7225b744692b9aca32b35b36ef"
         },
         {
           "path": "loom-agentdojo-output/workspace-user-task-1/001/local/workspace/user_task_1/none/none.json",
-          "bytes": 1668,
-          "sha256": "15f10e45cd4644646cc503aed735b9212141d765c8b62098f854cb78412e6c83"
+          "bytes": 1667,
+          "sha256": "6dd77c6a9f36d8f28fe6507f2ac492f8613deb01af42b6485dbf3856e4214de6"
         }
       ],
       "agentdojo_output": {
@@ -216,8 +216,8 @@
         "files": [
           {
             "path": "workspace-user-task-1/001/local/workspace/user_task_1/none/none.json",
-            "bytes": 1668,
-            "sha256": "15f10e45cd4644646cc503aed735b9212141d765c8b62098f854cb78412e6c83"
+            "bytes": 1667,
+            "sha256": "6dd77c6a9f36d8f28fe6507f2ac492f8613deb01af42b6485dbf3856e4214de6"
           }
         ]
       }
@@ -269,12 +269,12 @@
         {
           "path": "agentdojo-artifact-index.json",
           "bytes": 299,
-          "sha256": "7b7c37f4763514c151d769943f904e3862255ad849e6b6b577bf2d847e23326b"
+          "sha256": "962e277b5bdb5f2d7a14cc3585477fdb3327ded8d7ee57cc2d2a9f99c3a998fe"
         },
         {
           "path": "loom-agentdojo-output/workspace-user-task-1/002/local/workspace/user_task_1/none/none.json",
           "bytes": 1668,
-          "sha256": "399672572c8dd60022224a63c59c9ad6d427c2e3eab8b9367e2a03d3f2ea4416"
+          "sha256": "45defe464c6f6f210b465c284fc76a1532a2886b9a753ca833cbc15d6ded10e5"
         }
       ],
       "agentdojo_output": {
@@ -285,7 +285,7 @@
           {
             "path": "workspace-user-task-1/002/local/workspace/user_task_1/none/none.json",
             "bytes": 1668,
-            "sha256": "399672572c8dd60022224a63c59c9ad6d427c2e3eab8b9367e2a03d3f2ea4416"
+            "sha256": "45defe464c6f6f210b465c284fc76a1532a2886b9a753ca833cbc15d6ded10e5"
           }
         ]
       }

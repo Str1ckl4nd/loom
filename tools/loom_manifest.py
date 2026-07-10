@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from loom_contract import CORE_PREVIEW_VERSION, MANIFEST_SCHEMA_VERSION
+from loom_resources import normalize_execution_profile
 
 SAFE_ID = re.compile(r"[^A-Za-z0-9_.-]+")
 FINAL_STATES = {"clean", "dirty", "run_error", "needs_review", "accepted", "ignored", "blocked", "cancelled"}
@@ -184,6 +185,30 @@ def expected_contract(defaults: dict[str, Any], case: dict[str, Any], context: d
     return expected
 
 
+def execution_profile_spec(defaults: dict[str, Any], case: dict[str, Any], payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    """Merge scheduler-only placement and resource requests without mixing task env."""
+    raw: dict[str, Any] = {}
+    resources: dict[str, Any] = {}
+    layers = (
+        defaults.get("execution_profile"),
+        (defaults.get("payload") or {}).get("execution_profile") if isinstance(defaults.get("payload"), dict) else None,
+        case.get("execution_profile"),
+        payload.get("execution_profile"),
+    )
+    for layer in layers:
+        if layer is None:
+            continue
+        if not isinstance(layer, dict):
+            raise ValueError("execution_profile must be an object")
+        raw.update(layer)
+        if "resources" in layer:
+            if not isinstance(layer["resources"], dict):
+                raise ValueError("execution_profile.resources must be an object")
+            resources.update(layer["resources"])
+            raw["resources"] = resources
+    return normalize_execution_profile(expand_template(raw, context))
+
+
 def normalize(
     data: Any,
     *,
@@ -259,6 +284,7 @@ def normalize(
                 },
             }
         )
+        payload["execution_profile"] = execution_profile_spec(defaults, case, payload, context)
         retry_policy = merge_dicts(
             payload.get("retry_policy") if isinstance(payload.get("retry_policy"), dict) else None,
             defaults.get("retry_policy") if isinstance(defaults.get("retry_policy"), dict) else None,

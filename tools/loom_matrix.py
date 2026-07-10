@@ -31,6 +31,7 @@ from urllib.parse import quote, urlsplit
 
 from loom_contract import CONCURRENCY_POLICIES, CORE_PREVIEW_VERSION, INVENTORY_SCHEMA_VERSION
 from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, bearer_headers, token_from_env
+from loom_resources import normalize_capacity_overrides
 
 
 FINAL_STATES = {"clean", "dirty", "run_error", "needs_review", "accepted", "ignored", "blocked", "cancelled"}
@@ -255,6 +256,8 @@ def load_inventory(path: Path) -> dict[str, Any]:
         worker["max_concurrency"] = max_concurrency
         worker["initial_concurrency"] = initial_concurrency
         worker["concurrency_policy"] = policy
+        if "resource_capacity" in worker:
+            worker["resource_capacity"] = normalize_capacity_overrides(worker["resource_capacity"])
     return data
 
 
@@ -263,6 +266,7 @@ def remote_setup(host: dict[str, Any], remote_dir: str, tool_root: Path) -> None
     for name in (
         "loom_contract.py",
         "loom_http.py",
+        "loom_resources.py",
         "loom_hub.py",
         "loom_runner.py",
         "loom_manifest.py",
@@ -538,6 +542,7 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
     max_concurrency = int(worker.get("max_concurrency") or worker.get("cpu") or 1)
     initial_concurrency = int(worker.get("initial_concurrency") or 1)
     concurrency_policy = str(worker.get("concurrency_policy") or "fixed")
+    resource_capacity = json.dumps(worker.get("resource_capacity") or {}, ensure_ascii=False, separators=(",", ":"))
     capabilities = worker.get("capabilities") or ["linux"]
     cap_args = " ".join("--capability " + shlex.quote(str(cap)) for cap in capabilities)
     env_file = write_remote_env(worker, remote_dir, forwarded_env)
@@ -568,6 +573,7 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
         f"--max-concurrency {max_concurrency} "
         f"--initial-concurrency {initial_concurrency} "
         f"--concurrency-policy {shlex.quote(concurrency_policy)} "
+        f"--resource-capacity-json {shlex.quote(resource_capacity)} "
         f"--poll-seconds {int(worker.get('poll_seconds') or 5)} "
         f"--connection-mode {shlex.quote(worker_runtime_mode)} "
         f"--claim-wait-seconds {claim_wait} "
@@ -586,6 +592,7 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
         "initial_concurrency": initial_concurrency,
         "max_concurrency": max_concurrency,
         "concurrency_policy": concurrency_policy,
+        "resource_capacity": worker.get("resource_capacity") or {},
     }
     if mode == "direct-worker-api":
         url = direct_worker_url(worker)

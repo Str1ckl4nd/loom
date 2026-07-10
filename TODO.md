@@ -2,49 +2,45 @@
 
 ## Release Contract And AgentDojo Example
 
-- [ ] Add a versioned `phases` manifest contract that preserves the current
+- [x] Add a versioned `phases` manifest contract that preserves the current
   `commands` format. A phase needs a name, command, optional args, environment,
   working directory, timeout, and declared artifacts. Define and document the
   precedence as campaign defaults, case/run overrides, phase overrides, then
   immutable Loom runtime metadata.
-- [ ] Inject `campaign_id`, `case_id`, `setting_id`, `run_id`, `attempt_no`,
+- [x] Inject `campaign_id`, `case_id`, `setting_id`, `run_id`, `attempt_no`,
   worker ID, and phase identity into the phase process. Emit a structured phase
   report and an artifact manifest with paths, byte counts, and hashes.
-- [ ] Keep `case` and `run` independently selectable at dispatch time. Keep
+- [x] Keep `case` and `run` independently selectable at dispatch time. Keep
   `attempt` controller-owned: a retry creates the next attempt for the same
   task/recovery identity rather than accepting an arbitrary attempt number.
-- [ ] Make remote Hub and direct Runner APIs secure by default: loopback-only
+- [x] Make remote Hub and direct Runner APIs secure by default: loopback-only
   bind defaults, bearer-token configuration through environment variables, and
   authenticated registration, dispatch, result upload, and direct-worker calls.
-- [ ] Add remote-only automated coverage for manifest normalization, per-phase
+- [x] Add remote-only automated coverage for manifest normalization, per-phase
   injection, case/run filtering, retained retry attempts, result recovery,
-  and authenticated HTTP APIs. Run deterministic coverage in CI; run the
-  model-backed smoke test as a remote release job rather than on every commit.
-- [ ] Add a minimal, pinned AgentDojo campaign with two independently selectable
+  and authenticated HTTP APIs. Run deterministic coverage on an existing remote
+  host; run the model-backed smoke test as a remote release job rather than on
+  every commit.
+- [x] Add a minimal, pinned AgentDojo campaign with two independently selectable
   case/run records and a retry demonstration. Run it on a new inexpensive
   remote host, collect and redact the returned result package, and publish the
   recovered `task.json`, phase report, score/log summary, and artifact manifest
   under `examples/agentdojo/`.
-- [ ] Keep cloud resource creation out of Loom's supported scope. The remote
+- [x] Keep cloud resource creation out of Loom's supported scope. The remote
   validation recipe must explicitly include host shutdown/cleanup as its final
   step.
 
-Estimated active implementation time: about 5-7 hours, plus 30-90 minutes for
-the model-backed remote smoke test when provider credentials and quota are
-available.
-
 ## Resource Multiplexing And Local Mode
 
-- [ ] Make shared-host resource multiplexing an explicit Loom capability and
-  product distinction. Support multiple I/O-bound agent tasks on one long-lived
-  worker instead of assuming one isolated sandbox per trial.
-- [ ] Document the utilization and cost trade-off against per-task SaaS sandbox
-  models such as Harbor environment providers, without claiming an advantage
-  for CPU-bound or strict-isolation workloads.
+- [x] Make shared-host resource multiplexing an explicit Loom capability with
+  task resource reservations and `shared` / `exclusive` placement.
+- [x] Document that the scheduler improves use of existing capacity without
+  claiming an advantage for CPU-bound or strict-isolation workloads.
 - [ ] Benchmark throughput, CPU and memory utilization, queueing delay, failure
   interference, and cost per completed task at different concurrency levels.
-- [ ] Define optional isolation levels so operators can choose direct host
-  execution, separate processes, containers, or stronger external sandboxes.
+- [ ] Add operator-owned isolation adapters for direct host execution, separate
+  processes, containers, or stronger external sandboxes without making Loom a
+  cloud lifecycle tool.
 - [ ] Add a one-command local mode that starts an embedded Hub and localhost
   Runner automatically while preserving the same scheduling, lease, retry, and
   result-recovery semantics as multi-host mode.
