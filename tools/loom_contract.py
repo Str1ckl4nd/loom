@@ -1,11 +1,14 @@
-"""Internal definitions for Loom Core Preview v1 public contracts."""
+"""Internal definitions for the Loom v0.1.0 Core Preview and v1 protocols."""
 
 from __future__ import annotations
 
 from typing import Any
 
 
-CORE_PREVIEW_VERSION = "1.0.0-core-preview"
+PRODUCT_VERSION = "0.1.0"
+RELEASE_CHANNEL = "core-preview"
+# Kept as the public metadata key used by existing Preview integrations.
+CORE_PREVIEW_VERSION = PRODUCT_VERSION
 CLI_CONTRACT_VERSION = 1
 INVENTORY_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 1
@@ -64,6 +67,8 @@ def metadata(service: str) -> dict[str, Any]:
     api_version = HUB_API_VERSION if service == "hub" else RUNNER_API_VERSION if service == "runner" else None
     return {
         "service": service,
+        "product_version": PRODUCT_VERSION,
+        "release_channel": RELEASE_CHANNEL,
         "core_preview_version": CORE_PREVIEW_VERSION,
         "cli_contract_version": CLI_CONTRACT_VERSION,
         "inventory_schema_version": INVENTORY_SCHEMA_VERSION,

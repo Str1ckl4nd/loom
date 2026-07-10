@@ -1201,7 +1201,7 @@ def serve_direct_api(args: argparse.Namespace, work_root: Path) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Loom Runner.")
-    parser.add_argument("--version", action="version", version=f"Loom Runner Core Preview {CORE_PREVIEW_VERSION} (runner API v{RUNNER_API_VERSION})")
+    parser.add_argument("--version", action="version", version=f"Loom Runner v{CORE_PREVIEW_VERSION} Core Preview (runner API v{RUNNER_API_VERSION})")
     parser.add_argument("--controller", required=True)
     parser.add_argument("--controller-token-env", default=DEFAULT_HUB_TOKEN_ENV, help="Environment variable containing the Hub bearer token. Leave unset only for a loopback-only Hub.")
     parser.add_argument("--worker-id", default=f"worker-{socket.gethostname()}-{uuid.uuid4().hex[:8]}")

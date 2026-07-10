@@ -1,9 +1,10 @@
 # Release Contract
 
-This document defines the stable Core Preview v1 contract. A Loom release must
+This document defines the stable Core Preview v0.1 release contract. A Loom release must
 keep these boundaries intact even while the implementation evolves. The
 versioned public CLI, inventory, manifest, dispatch, token, and capability
-surface is listed in [Core Preview v1 Compatibility](CORE_PREVIEW_V1.md).
+surface is listed in [Core Preview v0.1 Compatibility](CORE_PREVIEW_V1.md) and
+[Versioning](VERSIONING.md).
 
 ## V1 Task Contract
 

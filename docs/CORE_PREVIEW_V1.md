@@ -1,9 +1,12 @@
-# Core Preview v1 Compatibility
+# Core Preview v0.1 Compatibility
 
-Loom Core Preview v1 freezes its public integration surface around versioned
+Loom Core Preview v0.1 freezes its public integration surface around versioned
 files, command-line entry points, and authenticated HTTP metadata. Downstream
 automation must use this surface. Importing a function from a file under
 `tools/` is not a supported integration and carries no compatibility promise.
+
+The product release is `v0.1.0`; the inventory, manifest, dispatch, Hub API,
+and Runner API contracts remain independently versioned at `v1`.
 
 ## Version Discovery
 

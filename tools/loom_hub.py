@@ -2814,7 +2814,7 @@ def cmd_push_task(args: argparse.Namespace) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Loom Hub.")
-    parser.add_argument("--version", action="version", version=f"Loom Hub Core Preview {CORE_PREVIEW_VERSION} (Hub API v{HUB_API_VERSION})")
+    parser.add_argument("--version", action="version", version=f"Loom Hub v{CORE_PREVIEW_VERSION} Core Preview (Hub API v{HUB_API_VERSION})")
     parser.add_argument("--benchmark-root", type=Path, default=Path(__file__).resolve().parents[1])
     sub = parser.add_subparsers(dest="cmd", required=True)
 

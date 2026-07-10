@@ -4,7 +4,7 @@ Loom schedules work on hosts you already own. A worker can therefore execute
 more than one I/O-bound task at once, but one host should not accept more work
 than its usable CPU, memory, disk, or accelerator budget.
 
-Core Preview v1 adds scheduler-level resource reservations. A reservation is
+Core Preview v0.1 adds scheduler-level resource reservations. A reservation is
 created atomically with a task lease and released when that lease reaches a
 non-active state. It applies to both pull claims and Direct Runner push.
 

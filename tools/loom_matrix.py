@@ -894,7 +894,7 @@ def build_validation_assertions(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an inventory-driven Loom Matrix validation.")
-    parser.add_argument("--version", action="version", version=f"Loom Matrix Core Preview {CORE_PREVIEW_VERSION} (inventory v{INVENTORY_SCHEMA_VERSION})")
+    parser.add_argument("--version", action="version", version=f"Loom Matrix v{CORE_PREVIEW_VERSION} Core Preview (inventory v{INVENTORY_SCHEMA_VERSION})")
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--dispatch-spec", type=Path, action="append", required=True, help="Normalized controller dispatch JSON; repeat for ordered phases.")
     parser.add_argument("--remote-dir", default="/tmp/loom")

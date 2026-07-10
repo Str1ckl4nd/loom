@@ -15,7 +15,7 @@ ZIPs.
 [Remote quick start](#remote-quick-start) |
 [Manifest](docs/TASK_MANIFEST.md) |
 [Architecture](docs/ARCHITECTURE.md) |
-[Core Preview v1](docs/CORE_PREVIEW_V1.md) |
+[v0.1 release and protocol versions](docs/VERSIONING.md) |
 [Release contract](docs/RELEASE_CONTRACT.md) |
 [Support scope](docs/SCOPE.md)
 
@@ -35,7 +35,7 @@ execution flow.
 - **Resource-aware shared-host admission.** A task can reserve CPU, memory,
   disk, and accelerators before it is leased, while `shared` and `exclusive`
   placement make host multiplexing explicit instead of accidental.
-- **Frozen Core Preview v1 contracts.** Versioned inventory, manifest, dispatch,
+- **Frozen Core Preview v0.1 contracts.** Versioned inventory, manifest, dispatch,
   token, CLI, and capability-query contracts keep downstream automation on a
   documented surface rather than internal Python helpers.
 - **Remote worker connections that persist.** Bootstrap workers once over SSH,
@@ -170,6 +170,7 @@ delivery protocol.
 | Guide | When to read it |
 | --- | --- |
 | [Loom Scope](docs/SCOPE.md) | Before changing host, provider, or resource-lifecycle behavior. |
+| [Versioning](docs/VERSIONING.md) | When deciding whether a change belongs in a patch, product release, or protocol version. |
 | [Loom Manifest](docs/TASK_MANIFEST.md) | When preparing a campaign, retry policy, private source, or expected-result contract. |
 | [Resource Admission](docs/RESOURCE_ADMISSION.md) | When sharing existing workers safely with declared task resource requests. |
 | [Release Contract](docs/RELEASE_CONTRACT.md) | When changing phases, Direct Runner delivery, authentication, result retention, or release gates. |

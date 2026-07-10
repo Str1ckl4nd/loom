@@ -355,7 +355,7 @@ def normalize(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Normalize benchmark task input for controller dispatch.")
-    parser.add_argument("--version", action="version", version=f"Loom Manifest Core Preview {CORE_PREVIEW_VERSION} (manifest v{MANIFEST_SCHEMA_VERSION})")
+    parser.add_argument("--version", action="version", version=f"Loom Manifest v{CORE_PREVIEW_VERSION} Core Preview (manifest v{MANIFEST_SCHEMA_VERSION})")
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--operator", default="manifest-normalizer")
     parser.add_argument("--output", type=Path, default=None)
