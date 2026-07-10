@@ -30,6 +30,25 @@
   validation recipe must explicitly include host shutdown/cleanup as its final
   step.
 
+## Next: Content-Addressed Cache And Cache-Affinity Scheduling
+
+- [ ] Add an immutable source descriptor to the manifest and dispatch contract.
+  Git sources should use a canonical URL plus resolved commit and checkout
+  options; generic input bundles should use URI, byte length, and SHA-256.
+- [ ] Give every Runner a bounded, lock-protected local source and input cache.
+  A cache hit must still create a fresh writable workspace for each attempt;
+  cache fill, verification failure, eviction, and corruption recovery must be
+  observable and safe under concurrent claims.
+- [ ] Make cache locality a soft scheduling preference for both pull and Direct
+  Push. Capability, resource admission, priority, and fairness remain hard
+  constraints; a cache miss must never block an otherwise eligible task.
+- [ ] Report cache key, hit/miss, transferred bytes, materialization time, and
+  eviction facts in Runner results and Hub queries without exposing source
+  credentials or turning Hub into a required blob store.
+- [ ] Extend the fixed remote release gate with same-digest reuse, changed-
+  digest refresh, and corrupt-cache recovery checks, then benchmark the
+  network, wall-clock, disk, and queueing impact on existing hosts.
+
 ## Resource Multiplexing And Local Mode
 
 - [x] Make shared-host resource multiplexing an explicit Loom capability with
