@@ -1,5 +1,9 @@
 # Loom
 
+<p align="center">
+  <img src="assets/loom-banner.png" alt="Loom - Remote Agent Evaluation Orchestration" width="100%">
+</p>
+
 **Leased Orchestration for Observable Model work.**
 
 Loom is a reliable, inventory-driven task control plane for agent evaluation.
