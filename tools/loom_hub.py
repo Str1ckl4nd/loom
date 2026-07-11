@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
+from loom_cache import attach_source_descriptor, source_cache_key
 from loom_contract import (
     CONCURRENCY_POLICIES,
     CORE_PREVIEW_VERSION,
@@ -637,6 +638,68 @@ def worker_resource_capacity(worker: sqlite3.Row | dict[str, Any]) -> dict[str, 
     capacity_raw = worker["resource_capacity_json"] if "resource_capacity_json" in worker.keys() else worker.get("resource_capacity")
     resource_raw = worker["resource_json"] if "resource_json" in worker.keys() else worker.get("resources")
     return normalize_capacity(json_object(capacity_raw), snapshot=json_object(resource_raw))
+
+
+def task_source_cache_key(task: sqlite3.Row | dict[str, Any]) -> str | None:
+    payload_raw = task["payload_json"] if "payload_json" in task.keys() else task.get("payload")
+    payload = json_object(payload_raw)
+    if str(payload.get("runner") or "noop") != "repo":
+        return None
+    return source_cache_key(payload)
+
+
+def attach_task_source_descriptor(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep source-cache identity scoped to repository materialization tasks."""
+    if str(payload.get("runner") or "noop") != "repo":
+        if payload.get("source_descriptor") is not None:
+            raise ValueError("payload.source_descriptor requires runner: repo")
+        return None
+    return attach_source_descriptor(payload)
+
+
+def worker_source_cache_inventory(worker: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    health_raw = worker["health_json"] if "health_json" in worker.keys() else worker.get("health")
+    health = json_object(health_raw)
+    raw = health.get("source_cache") if isinstance(health.get("source_cache"), dict) else {}
+    keys = []
+    for value in raw.get("keys") or []:
+        key = source_cache_key({"source_descriptor": {"type": "git", "cache_key": value}})
+        if key is not None:
+            keys.append(key)
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "entry_count": max(0, safe_int(raw.get("entry_count"))),
+        "bytes": max(0, safe_int(raw.get("bytes"))),
+        "max_bytes": max(0, safe_int(raw.get("max_bytes"))),
+        "keys": sorted(set(keys)),
+        "keys_truncated": bool(raw.get("keys_truncated", False)),
+    }
+
+
+def task_cache_affinity(task: sqlite3.Row | dict[str, Any], worker: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    key = task_source_cache_key(task)
+    inventory = worker_source_cache_inventory(worker)
+    if key is None:
+        return {
+            "cache_key": None,
+            "cache_hit": False,
+            "worker_cache_enabled": inventory["enabled"],
+            "reason": "task_has_no_immutable_source",
+        }
+    if not inventory["enabled"]:
+        return {
+            "cache_key": key,
+            "cache_hit": False,
+            "worker_cache_enabled": False,
+            "reason": "worker_cache_disabled",
+        }
+    hit = key in set(inventory["keys"])
+    return {
+        "cache_key": key,
+        "cache_hit": hit,
+        "worker_cache_enabled": True,
+        "reason": "cache_hit" if hit else "cache_miss",
+    }
 
 
 def worker_concurrency_state(
@@ -1378,6 +1441,19 @@ class Handler(BaseHTTPRequestHandler):
                         )
                 self._json(200, {"workers": workers})
                 return
+            if path == "/api/data/worker-cache":
+                with self._db() as conn:
+                    workers = [
+                        {
+                            "worker_id": worker["worker_id"],
+                            "status": worker["status"],
+                            "last_seen_at": worker["last_seen_at"],
+                            "source_cache": worker_source_cache_inventory(worker),
+                        }
+                        for worker in conn.execute("SELECT * FROM workers ORDER BY worker_id")
+                    ]
+                self._json(200, {"workers": workers})
+                return
             if path == "/api/data/task-admission":
                 task_id = str(qs.get("task_id", [""])[0]).strip()
                 if not task_id:
@@ -1391,15 +1467,16 @@ class Handler(BaseHTTPRequestHandler):
                     candidates = []
                     for worker in conn.execute("SELECT * FROM workers ORDER BY worker_id"):
                         worker_id = str(worker["worker_id"])
+                        affinity = task_cache_affinity(task, worker)
                         if int(worker["blocked"] or 0):
-                            candidates.append({"worker_id": worker_id, "ok": False, "reason": "worker_blocked"})
+                            candidates.append({"worker_id": worker_id, "ok": False, "reason": "worker_blocked", "cache_affinity": affinity})
                             continue
                         capabilities = json.loads(worker["capabilities_json"] or "[]")
                         if not worker_can_run(task, capabilities, worker_id):
-                            candidates.append({"worker_id": worker_id, "ok": False, "reason": "worker_not_eligible"})
+                            candidates.append({"worker_id": worker_id, "ok": False, "reason": "worker_not_eligible", "cache_affinity": affinity})
                             continue
                         admission = worker_resource_admission(conn, worker, task)
-                        candidates.append({"worker_id": worker_id, **admission})
+                        candidates.append({"worker_id": worker_id, **admission, "cache_affinity": affinity})
                 self._json(
                     200,
                     {
@@ -1610,8 +1687,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(spec, dict):
                     raise ValueError(f"tasks[{index}] must be an object")
                 merged_dispatch_extensions(payload, spec)
+                dispatch_payload = payload.get("payload") or {}
+                spec_payload = spec.get("payload") or {}
+                if not isinstance(dispatch_payload, dict) or not isinstance(spec_payload, dict):
+                    raise ValueError(f"tasks[{index}].payload must be an object")
+                source_payload = dict(dispatch_payload)
+                source_payload.update(spec_payload)
+                attach_task_source_descriptor(source_payload)
         except ValueError as exc:
-            self._json(400, {"error": "invalid_task_extensions", "detail": str(exc)})
+            error = "invalid_source_descriptor" if "source_descriptor" in str(exc) or "git source" in str(exc) else "invalid_task_extensions"
+            self._json(400, {"error": error, "detail": str(exc)})
             return
         created: list[dict[str, Any]] = []
         existing: list[dict[str, Any]] = []
@@ -1632,6 +1717,7 @@ class Handler(BaseHTTPRequestHandler):
                 execution_profile = spec.get("execution_profile", task_payload.get("execution_profile"))
                 if execution_profile is not None:
                     task_payload["execution_profile"] = normalize_execution_profile(execution_profile)
+                attach_task_source_descriptor(task_payload)
                 normalized = task_payload.get("normalized") if isinstance(task_payload.get("normalized"), dict) else {}
                 run_id = spec.get("run_id") or normalized.get("run_id")
                 setting_id = spec.get("setting_id") or normalized.get("setting_id")
@@ -1899,9 +1985,20 @@ class Handler(BaseHTTPRequestHandler):
                 SELECT * FROM tasks
                 WHERE state IN ('queued','retry_queued')
                 ORDER BY priority DESC, created_at
-                LIMIT 100
+                LIMIT 500
                 """
             ).fetchall()
+            cache_inventory = worker_source_cache_inventory(worker)
+            worker_cache_keys = set(cache_inventory["keys"]) if cache_inventory["enabled"] else set()
+            rows = sorted(
+                rows,
+                key=lambda task: (
+                    -safe_int(task["priority"]),
+                    0 if (task_source_cache_key(task) in worker_cache_keys) else 1,
+                    str(task["created_at"] or ""),
+                    str(task["task_id"]),
+                ),
+            )
             for task in rows:
                 if len(claimed) >= limit:
                     break
@@ -1910,6 +2007,7 @@ class Handler(BaseHTTPRequestHandler):
                 resource_admission = worker_resource_admission(conn, worker, task)
                 if not resource_admission["ok"]:
                     continue
+                cache_affinity = task_cache_affinity(task, worker)
                 conn.execute(
                     """
                     UPDATE tasks
@@ -1918,7 +2016,16 @@ class Handler(BaseHTTPRequestHandler):
                     """,
                     (worker_id, lease_until, utc_now(), task["task_id"]),
                 )
-                log_task_event(conn, task["task_id"], "task_claimed", "worker", worker_id, task["state"], "leased", {"lease_until": lease_until})
+                log_task_event(
+                    conn,
+                    task["task_id"],
+                    "task_claimed",
+                    "worker",
+                    worker_id,
+                    task["state"],
+                    "leased",
+                    {"lease_until": lease_until, "cache_affinity": cache_affinity},
+                )
                 claimed.append(
                     {
                         "task_id": task["task_id"],
@@ -1940,6 +2047,7 @@ class Handler(BaseHTTPRequestHandler):
                             "concurrency_policy": concurrency_policy,
                             "active_count_at_claim": active_count,
                             "resource_admission": resource_admission,
+                            "cache_affinity": cache_affinity,
                         },
                     }
                 )
@@ -2033,6 +2141,7 @@ class Handler(BaseHTTPRequestHandler):
             initial_concurrency = max(1, min(int(worker["initial_concurrency"] or 1), max_concurrency))
             concurrency_policy = str(worker["concurrency_policy"] or "fixed")
             active_count = concurrency["active_count"]
+            cache_affinity = task_cache_affinity(task, worker)
             now = utc_now()
             conn.execute(
                 """
@@ -2051,7 +2160,12 @@ class Handler(BaseHTTPRequestHandler):
                 operator,
                 task["state"],
                 "leased",
-                {"worker_id": worker_id, "lease_until": lease_until, "push_id": push_id},
+                {
+                    "worker_id": worker_id,
+                    "lease_until": lease_until,
+                    "push_id": push_id,
+                    "cache_affinity": cache_affinity,
+                },
             )
             conn.commit()
         return 200, {
@@ -2075,16 +2189,12 @@ class Handler(BaseHTTPRequestHandler):
                 "active_count_at_claim": active_count,
                 "dispatch_mode": "direct-push",
                 "resource_admission": resource_admission,
+                "cache_affinity": cache_affinity,
             },
             "controller_push": {"push_id": push_id, "leased_at": now},
         }
 
-    def _direct_worker_endpoint(self, worker_id: str) -> tuple[str, str] | None:
-        with self._db() as conn:
-            row = conn.execute(
-                "SELECT connection_mode,endpoint_json FROM worker_hosts WHERE worker_id=? ORDER BY updated_at DESC LIMIT 1",
-                (worker_id,),
-            ).fetchone()
+    def _direct_worker_endpoint_from_row(self, row: sqlite3.Row | None) -> tuple[str, str] | None:
         if row is None or str(row["connection_mode"] or "") != "direct-worker-api":
             return None
         endpoint = json.loads(row["endpoint_json"] or "{}")
@@ -2098,24 +2208,98 @@ class Handler(BaseHTTPRequestHandler):
         token_env = str(endpoint.get("direct_api_token_env") or self.server.runner_token_env or DEFAULT_RUNNER_TOKEN_ENV)
         return url, token_env
 
+    def _direct_worker_endpoint(self, worker_id: str) -> tuple[str, str] | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT connection_mode,endpoint_json FROM worker_hosts WHERE worker_id=? ORDER BY updated_at DESC LIMIT 1",
+                (worker_id,),
+            ).fetchone()
+        return self._direct_worker_endpoint_from_row(row)
+
+    def _select_cache_affine_direct_worker(self, task_id: str) -> tuple[int, dict[str, Any]]:
+        """Choose a direct Runner without making cache locality a hard gate."""
+        with self._db() as conn:
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if task is None:
+                return 404, {"error": "task_not_found", "task_id": task_id}
+            if task["state"] not in {"queued", "retry_queued"}:
+                return 409, {"error": "task_not_queueable", "task_id": task_id, "state": task["state"]}
+            candidates: list[dict[str, Any]] = []
+            for worker in conn.execute("SELECT * FROM workers WHERE blocked=0 ORDER BY worker_id"):
+                worker_id = str(worker["worker_id"])
+                host = conn.execute(
+                    "SELECT connection_mode,endpoint_json FROM worker_hosts WHERE worker_id=? ORDER BY updated_at DESC LIMIT 1",
+                    (worker_id,),
+                ).fetchone()
+                endpoint = self._direct_worker_endpoint_from_row(host)
+                if endpoint is None:
+                    continue
+                url, token_env = endpoint
+                parsed = urlparse(url)
+                runner_token = token_from_env(token_env)
+                if not runner_token and not is_loopback_host(parsed.hostname or ""):
+                    continue
+                capabilities = json.loads(worker["capabilities_json"] or "[]")
+                if not worker_can_run(task, capabilities, worker_id):
+                    continue
+                admission = worker_resource_admission(conn, worker, task)
+                if not admission["ok"]:
+                    continue
+                affinity = task_cache_affinity(task, worker)
+                candidates.append(
+                    {
+                        "worker_id": worker_id,
+                        "url": url,
+                        "token_env": token_env,
+                        "runner_token": runner_token,
+                        "cache_affinity": affinity,
+                        "active_count": admission["concurrency"]["active_count"],
+                    }
+                )
+        if not candidates:
+            return 409, {"error": "no_eligible_direct_worker", "task_id": task_id}
+        selected = sorted(
+            candidates,
+            key=lambda item: (
+                0 if item["cache_affinity"]["cache_hit"] else 1,
+                int(item["active_count"]),
+                str(item["worker_id"]),
+            ),
+        )[0]
+        return 200, selected
+
     def _push_task(self) -> None:
         payload = self._read_json()
         task_id = str(payload.get("task_id") or "")
         worker_id = str(payload.get("worker_id") or "")
         operator = str(payload.get("operator") or "direct-push")
-        if not task_id or not worker_id:
-            self._json(400, {"error": "task_id_and_worker_id_required"})
+        if not task_id:
+            self._json(400, {"error": "task_id_required"})
             return
-        endpoint = self._direct_worker_endpoint(worker_id)
-        if endpoint is None:
-            self._json(409, {"error": "direct_worker_endpoint_not_registered", "worker_id": worker_id})
-            return
-        url, token_env = endpoint
-        parsed = urlparse(url)
-        runner_token = token_from_env(token_env)
-        if not runner_token and not is_loopback_host(parsed.hostname or ""):
-            self._json(400, {"error": "runner_token_missing", "worker_id": worker_id, "token_env": token_env})
-            return
+        selection_mode = "explicit"
+        selection: dict[str, Any] = {}
+        if worker_id:
+            endpoint = self._direct_worker_endpoint(worker_id)
+            if endpoint is None:
+                self._json(409, {"error": "direct_worker_endpoint_not_registered", "worker_id": worker_id})
+                return
+            url, token_env = endpoint
+            parsed = urlparse(url)
+            runner_token = token_from_env(token_env)
+            if not runner_token and not is_loopback_host(parsed.hostname or ""):
+                self._json(400, {"error": "runner_token_missing", "worker_id": worker_id, "token_env": token_env})
+                return
+        else:
+            selection_mode = "cache-affine-auto"
+            status, selected = self._select_cache_affine_direct_worker(task_id)
+            if status != 200:
+                self._json(status, selected)
+                return
+            worker_id = str(selected["worker_id"])
+            url = str(selected["url"])
+            token_env = str(selected["token_env"])
+            runner_token = selected.get("runner_token")
+            selection = {"mode": selection_mode, "cache_affinity": selected["cache_affinity"]}
         status, task = self._lease_task_for_worker(
             task_id=task_id,
             worker_id=worker_id,
@@ -2155,6 +2339,7 @@ class Handler(BaseHTTPRequestHandler):
                     "worker_id": worker_id,
                     "state": "leased",
                     "lease_until": task["lease_until"],
+                    "selection": selection or {"mode": selection_mode},
                 },
             )
             return
@@ -2167,10 +2352,26 @@ class Handler(BaseHTTPRequestHandler):
                 f"controller pushed leased task {task_id} to worker {worker_id}",
                 worker_id=worker_id,
                 task_id=task_id,
-                payload={"url": url, "runner_response": runner_response, "attempt_no": task["attempt_no"]},
+                payload={
+                    "url": url,
+                    "runner_response": runner_response,
+                    "attempt_no": task["attempt_no"],
+                    "selection": selection or {"mode": selection_mode},
+                },
             )
             conn.commit()
-        self._json(202, {"ok": True, "task_id": task_id, "worker_id": worker_id, "lease_until": task["lease_until"], "runner": runner_response})
+        cache_affinity = (task.get("controller_concurrency") or {}).get("cache_affinity") or selection.get("cache_affinity")
+        self._json(
+            202,
+            {
+                "ok": True,
+                "task_id": task_id,
+                "worker_id": worker_id,
+                "lease_until": task["lease_until"],
+                "runner": runner_response,
+                "selection": {"mode": selection_mode, "cache_affinity": cache_affinity},
+            },
+        )
 
     def _task_state_from_worker(self, new_state: str, event_type: str) -> None:
         payload = self._read_json()
@@ -2767,6 +2968,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
         "worker_hosts": request_json(base + "/api/data/worker-hosts", token=controller_token(args)),
         "workers": request_json(base + "/api/data/active-workers", token=controller_token(args)),
         "worker_capacity": request_json(base + "/api/data/worker-capacity", token=controller_token(args)),
+        "worker_cache": request_json(base + "/api/data/worker-cache", token=controller_token(args)),
         "tasks": request_json(base + "/api/tasks?limit=200", token=controller_token(args)),
         "results": request_json(base + f"/api/data/new-results?cursor={args.cursor}&limit=200", token=controller_token(args)),
         "error_rate": request_json(base + "/api/data/error-rate?by=state&window_seconds=86400", token=controller_token(args)),
@@ -2778,6 +2980,12 @@ def cmd_summary(args: argparse.Namespace) -> int:
 
 def cmd_worker_capacity(args: argparse.Namespace) -> int:
     out = request_json(args.controller.rstrip("/") + "/api/data/worker-capacity", token=controller_token(args))
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_worker_cache(args: argparse.Namespace) -> int:
+    out = request_json(args.controller.rstrip("/") + "/api/data/worker-cache", token=controller_token(args))
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
@@ -2920,6 +3128,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     add_controller_auth_arg(p)
     p.set_defaults(func=cmd_worker_capacity)
 
+    p = sub.add_parser("worker-cache")
+    p.add_argument("--controller", default="http://127.0.0.1:8765")
+    add_controller_auth_arg(p)
+    p.set_defaults(func=cmd_worker_cache)
+
     p = sub.add_parser("task-admission")
     p.add_argument("--controller", default="http://127.0.0.1:8765")
     p.add_argument("--task-id", required=True)
@@ -2958,7 +3171,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = sub.add_parser("push-task")
     p.add_argument("--controller", default="http://127.0.0.1:8765")
     p.add_argument("--task-id", required=True)
-    p.add_argument("--worker-id", required=True)
+    p.add_argument("--worker-id", help="Exact Direct Runner. Omit to choose an eligible Runner with a cache-locality preference.")
     p.add_argument("--operator", default="direct-push")
     p.add_argument("--lease-seconds", type=int, default=600)
     p.add_argument("--push-timeout-seconds", type=int, default=30)

@@ -4,7 +4,7 @@ Loom separates its product release from the protocols consumed by automation.
 
 ## Current Release
 
-The current public release is **Loom v0.2.0 Core Preview**. The `--version`
+The current public release is **Loom v0.3.0 Core Preview**. The `--version`
 output and authenticated `/api/meta` documents are the canonical discovery
 surface for a deployed process.
 

@@ -38,17 +38,17 @@
 
 ## Next: Content-Addressed Cache And Cache-Affinity Scheduling
 
-- [ ] Add an immutable source descriptor to the manifest and dispatch contract.
-  Git sources should use a canonical URL plus resolved commit and checkout
-  options; generic input bundles should use URI, byte length, and SHA-256.
-- [ ] Give every Runner a bounded, lock-protected local source and input cache.
-  A cache hit must still create a fresh writable workspace for each attempt;
-  cache fill, verification failure, eviction, and corruption recovery must be
-  observable and safe under concurrent claims.
-- [ ] Make cache locality a soft scheduling preference for both pull and Direct
+- [x] Add an immutable Git source descriptor to the manifest and dispatch
+  contract using a canonical URL plus resolved commit. Generic input bundles
+  still need a separate URI, byte-length, and SHA-256 contract.
+- [x] Give every Runner a bounded, lock-protected local Git source cache. A
+  hit creates a fresh writable worktree per attempt; fill, verification failure,
+  eviction, and corruption recovery are observable. Generic input caching is
+  still pending.
+- [x] Make cache locality a soft scheduling preference for both Pull and Direct
   Push. Capability, resource admission, priority, and fairness remain hard
-  constraints; a cache miss must never block an otherwise eligible task.
-- [ ] Report cache key, hit/miss, transferred bytes, materialization time, and
+  constraints; a cache miss never blocks an otherwise eligible task.
+- [x] Report cache key, hit/miss, transferred bytes, materialization time, and
   eviction facts in Runner results and Hub queries without exposing source
   credentials or turning Hub into a required blob store.
 - [ ] Extend the fixed remote release gate with same-digest reuse, changed-

@@ -1,4 +1,4 @@
-"""Internal definitions for the Loom v0.2.0 Core Preview and v1 protocols."""
+"""Internal definitions for the Loom v0.3.0 Core Preview and v1 protocols."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 
-PRODUCT_VERSION = "0.2.0"
+PRODUCT_VERSION = "0.3.0"
 RELEASE_CHANNEL = "core-preview"
 # Kept as the public metadata key used by existing Preview integrations.
 CORE_PREVIEW_VERSION = PRODUCT_VERSION
@@ -59,6 +59,9 @@ def metadata(service: str) -> dict[str, Any]:
             "direct-runner-push",
             "attempt-result-retention",
             "task-extensions-v1",
+            "immutable-source-descriptor-v1",
+            "cache-affinity-v1",
+            "worker-cache-inventory-v1",
         ],
         "runner": [
             "runner-api-v1",
@@ -73,6 +76,8 @@ def metadata(service: str) -> dict[str, Any]:
             "fixed-concurrency",
             "adaptive-concurrency",
             "task-extensions-v1",
+            "immutable-source-descriptor-v1",
+            "source-cache-v1",
         ],
         "matrix": [
             "matrix-cli-v1",
@@ -83,6 +88,8 @@ def metadata(service: str) -> dict[str, Any]:
             "direct-runner-pull",
             "direct-runner-push",
             "task-extensions-v1",
+            "source-cache-config-v1",
+            "cache-affinity-v1",
         ],
         "manifest": [
             "manifest-v1",
@@ -91,6 +98,7 @@ def metadata(service: str) -> dict[str, Any]:
             "retry-contract",
             "execution-profile-v1",
             "task-extensions-v1",
+            "immutable-source-descriptor-v1",
         ],
     }
     api_version = HUB_API_VERSION if service == "hub" else RUNNER_API_VERSION if service == "runner" else None

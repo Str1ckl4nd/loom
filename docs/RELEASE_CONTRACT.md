@@ -1,9 +1,9 @@
 # Release Contract
 
-This document defines the stable Core Preview v0.2 release contract. A Loom release must
+This document defines the stable Core Preview v0.3 release contract. A Loom release must
 keep these boundaries intact even while the implementation evolves. The
 versioned public CLI, inventory, manifest, dispatch, token, and capability
-surface is listed in [Core Preview v0.2 Compatibility](CORE_PREVIEW_V1.md) and
+surface is listed in [Core Preview v0.3 Compatibility](CORE_PREVIEW_V1.md) and
 [Versioning](VERSIONING.md).
 
 ## V1 Task Contract
@@ -63,6 +63,12 @@ In both modes, long work renews its Hub lease while it runs. A failed delivery
 whose outcome is unknown remains leased until normal recovery, rather than
 being blindly dispatched twice.
 
+For immutable Git task sources, cache locality is a soft preference after task
+priority and before FIFO tie-breaking among otherwise equal queued tasks. It
+never bypasses capability, retry, resource, placement, or concurrency checks.
+`push-task` may omit `worker_id` to choose an eligible Direct Runner with the
+same preference; a supplied worker ID remains exact.
+
 Worker `resource_capacity` and task `execution_profile` are part of the same
 lease admission decision. Hub atomically reserves declared CPU, memory, disk,
 and accelerator values for `leased` and `running` tasks. `shared` placement may
@@ -96,6 +102,12 @@ Every repository result package includes at least:
 
 When supplied, `payload.extensions` is retained in `task.json` and mirrored as
 `task_extensions` in `worker-result.json`.
+
+For a repository task with a cacheable immutable Git source,
+`worker-result.json` additionally includes `source_cache`: cache key, hit/miss
+or repair state, approximate cached bytes added, materialization duration, and
+eviction or fallback facts. The cache key and canonical source identity are
+safe to query; source credentials and cache contents are not exported.
 
 Result ZIPs exclude the source checkout. Retried attempts remain queryable by
 the same task ID and distinct `attempt_no`; a later clean attempt cannot erase a

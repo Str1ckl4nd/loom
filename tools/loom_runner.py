@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 import glob
 import hashlib
 import json
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
+from loom_cache import cache_key_digest, canonical_git_url, git_checkout_ref, git_source_descriptor, source_cache_key
 from loom_contract import CONCURRENCY_POLICIES, CORE_PREVIEW_VERSION, RUNNER_API_VERSION, metadata, normalize_extensions
 from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, bearer_headers, is_loopback_host, token_from_env, token_matches
 from loom_resources import normalize_capacity, normalize_capacity_overrides
@@ -46,6 +48,9 @@ DEFAULT_LOCAL_COPY_IGNORES = {
     "loom-runs",
 }
 GNU_TIME = Path("/usr/bin/time")
+DEFAULT_SOURCE_CACHE_MAX_MB = 4096
+SOURCE_CACHE_LOCK_TIMEOUT_SECONDS = 120
+SOURCE_CACHE_STALE_LOCK_SECONDS = 1800
 
 
 def resource_snapshot(path: Path | None = None) -> dict[str, Any]:
@@ -426,6 +431,192 @@ def collect_artifacts(workspace_dir: Path, task_dir: Path, patterns: list[str]) 
     return collected
 
 
+def directory_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.stat(Path(root) / name, follow_symlinks=False).st_size
+            except OSError:
+                continue
+    return total
+
+
+def read_cache_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def cache_entry_paths(cache_root: Path, cache_key: str) -> tuple[Path, Path, Path]:
+    digest = cache_key_digest(cache_key)
+    entry = cache_root / "git" / digest
+    return entry, entry / "repo.git", entry / "metadata.json"
+
+
+@contextmanager
+def source_cache_lock(cache_root: Path, cache_key: str, *, timeout_seconds: int = SOURCE_CACHE_LOCK_TIMEOUT_SECONDS) -> Any:
+    """Serialize a cache fill or repair without retaining a process-global lock."""
+    digest = cache_key_digest(cache_key)
+    lock_dir = cache_root / ".locks" / digest
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    owner_token = uuid.uuid4().hex
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    while True:
+        try:
+            lock_dir.mkdir()
+            write_json(lock_dir / "owner.json", {"token": owner_token, "created_at": utc_now()})
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - lock_dir.stat().st_mtime
+            except OSError:
+                age = 0
+            if age >= SOURCE_CACHE_STALE_LOCK_SECONDS:
+                shutil.rmtree(lock_dir, ignore_errors=True)
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for source cache lock: {cache_key}")
+            time.sleep(0.2)
+    try:
+        yield
+    finally:
+        owner = read_cache_json(lock_dir / "owner.json")
+        if owner.get("token") == owner_token:
+            shutil.rmtree(lock_dir, ignore_errors=True)
+
+
+def cache_repo_has_active_worktrees(repo_dir: Path) -> bool:
+    worktrees = repo_dir / "worktrees"
+    try:
+        return worktrees.is_dir() and any(worktrees.iterdir())
+    except OSError:
+        return True
+
+
+def source_cache_inventory(cache_root: Path, *, key_limit: int = 256) -> dict[str, Any]:
+    git_root = cache_root / "git"
+    entries: list[tuple[str, int]] = []
+    if git_root.is_dir():
+        for entry in git_root.iterdir():
+            if not entry.is_dir():
+                continue
+            metadata = read_cache_json(entry / "metadata.json")
+            key = source_cache_key({"source_descriptor": metadata.get("descriptor")})
+            if key is None or not (entry / "repo.git").is_dir():
+                continue
+            entries.append((key, directory_bytes(entry)))
+    entries.sort(key=lambda item: item[0])
+    return {
+        "enabled": True,
+        "entry_count": len(entries),
+        "bytes": sum(size for _, size in entries),
+        "keys": [key for key, _ in entries[:key_limit]],
+        "keys_truncated": len(entries) > key_limit,
+    }
+
+
+def evict_source_cache(cache_root: Path, max_bytes: int, *, keep_key: str) -> dict[str, Any]:
+    """Remove oldest inactive cache entries until the configured budget fits."""
+    if max_bytes <= 0:
+        return {"entries": [], "bytes": 0, "over_limit": False}
+    git_root = cache_root / "git"
+    if not git_root.is_dir():
+        return {"entries": [], "bytes": 0, "over_limit": False}
+    candidates: list[dict[str, Any]] = []
+    total = 0
+    for entry in git_root.iterdir():
+        if not entry.is_dir():
+            continue
+        metadata = read_cache_json(entry / "metadata.json")
+        key = source_cache_key({"source_descriptor": metadata.get("descriptor")})
+        if key is None:
+            continue
+        size = directory_bytes(entry)
+        total += size
+        candidates.append(
+            {
+                "entry": entry,
+                "key": key,
+                "size": size,
+                "last_used_at": str(metadata.get("last_used_at") or ""),
+                "repo": entry / "repo.git",
+            }
+        )
+    evicted: list[str] = []
+    evicted_bytes = 0
+    for candidate in sorted(candidates, key=lambda item: (item["last_used_at"], item["key"])):
+        if total <= max_bytes:
+            break
+        if candidate["key"] == keep_key:
+            continue
+        lock_dir = cache_root / ".locks" / cache_key_digest(candidate["key"])
+        if lock_dir.exists() or cache_repo_has_active_worktrees(candidate["repo"]):
+            continue
+        shutil.rmtree(candidate["entry"], ignore_errors=True)
+        total -= int(candidate["size"])
+        evicted.append(str(candidate["key"]))
+        evicted_bytes += int(candidate["size"])
+    return {"entries": evicted, "bytes": evicted_bytes, "over_limit": total > max_bytes}
+
+
+def cached_git_repo_valid(repo_dir: Path, commit: str, *, timeout: int) -> bool:
+    if not repo_dir.is_dir():
+        return False
+    try:
+        check = subprocess.run(
+            ["git", "--git-dir", str(repo_dir), "cat-file", "-e", f"{commit}^{{commit}}"],
+            cwd=str(repo_dir.parent),
+            text=True,
+            capture_output=True,
+            timeout=max(30, min(timeout, 120)),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return check.returncode == 0
+
+
+def log_cache_git_command(task_dir: Path, name: str, proc: subprocess.CompletedProcess[str], source_url: str) -> dict[str, Any]:
+    record = write_command_logs(task_dir, name, proc)
+    if isinstance(record.get("command"), list):
+        record["command"] = ["<source>" if str(part) == source_url else part for part in record["command"]]
+    return record
+
+
+def clone_git_mirror(
+    source: dict[str, Any],
+    repo_dir: Path,
+    task_dir: Path,
+    timeout: int,
+    *,
+    step_prefix: str,
+) -> tuple[bool, list[dict[str, Any]], str | None]:
+    url = str(source.get("url") or source.get("repo_url") or "")
+    git_env, askpass_path = git_auth_environment(source)
+    steps: list[dict[str, Any]] = []
+    try:
+        clone_cmd = ["git", "-c", "http.version=HTTP/1.1", "clone", "--mirror", url, str(repo_dir)]
+        clone = run_process(clone_cmd, cwd=task_dir, timeout=timeout, env=git_env)
+        steps.append(log_cache_git_command(task_dir, f"{step_prefix}-clone", clone, url))
+        attempt = 1
+        while clone.returncode != 0 and transient_git_failure(clone) and attempt < 3:
+            attempt += 1
+            shutil.rmtree(repo_dir, ignore_errors=True)
+            time.sleep(attempt * 2)
+            clone = run_process(clone_cmd, cwd=task_dir, timeout=timeout, env=git_env)
+            steps.append(log_cache_git_command(task_dir, f"{step_prefix}-clone-retry-{attempt}", clone, url))
+        if clone.returncode != 0:
+            return False, steps, "transient_git_network_error" if transient_git_failure(clone) else "git_cache_clone_failed"
+        return True, steps, None
+    finally:
+        if askpass_path is not None:
+            askpass_path.unlink(missing_ok=True)
+
+
 def transient_git_failure(proc: subprocess.CompletedProcess[str]) -> bool:
     text = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
     return any(
@@ -450,12 +641,14 @@ def materialize_git_source(source: dict[str, Any], workspace_dir: Path, task_dir
     if not url:
         raise ValueError("repo runner source requires url")
     ref = source.get("ref")
+    checkout_ref = git_checkout_ref(source)
+    immutable_commit = git_source_descriptor(source)
     depth = source.get("depth")
     git_prefix = ["git", "-c", "http.version=HTTP/1.1"]
     clone_cmd = [*git_prefix, "clone"]
     if depth:
         clone_cmd.extend(["--depth", str(depth)])
-    if ref and source.get("branch", True):
+    if ref and source.get("branch", True) and immutable_commit is None:
         clone_cmd.extend(["--branch", str(ref)])
     clone_cmd.extend([url, str(workspace_dir)])
     git_env, askpass_path = git_auth_environment(source)
@@ -471,15 +664,15 @@ def materialize_git_source(source: dict[str, Any], workspace_dir: Path, task_dir
             steps.append(write_command_logs(task_dir, f"materialize-git-clone-retry-{attempt}", clone))
         if clone.returncode != 0 and transient_git_failure(clone):
             return {"ok": False, "steps": steps, "failure": "transient_git_network_error"}
-        if clone.returncode != 0 and ref:
+        if clone.returncode != 0 and checkout_ref:
             shutil.rmtree(workspace_dir, ignore_errors=True)
             fallback_cmd = [*git_prefix, "clone", url, str(workspace_dir)]
             clone = run_process(fallback_cmd, cwd=task_dir, timeout=timeout, env=git_env)
             steps.append(write_command_logs(task_dir, "materialize-git-clone-fallback", clone))
         if clone.returncode != 0:
             return {"ok": False, "steps": steps}
-        if ref:
-            checkout = run_process(["git", "checkout", str(ref)], cwd=workspace_dir, timeout=timeout, env=git_env)
+        if checkout_ref:
+            checkout = run_process(["git", "checkout", str(checkout_ref)], cwd=workspace_dir, timeout=timeout, env=git_env)
             steps.append(write_command_logs(task_dir, "materialize-git-checkout", checkout))
             if checkout.returncode != 0:
                 return {"ok": False, "steps": steps}
@@ -491,12 +684,201 @@ def materialize_git_source(source: dict[str, Any], workspace_dir: Path, task_dir
     return {
         "ok": rev.returncode == 0,
         "type": "git",
-        "url": url,
+        "url": canonical_git_url(url),
         "ref": ref,
         "commit": (rev.stdout or "").strip() if rev.returncode == 0 else None,
         "token_env": str(source.get("token_env") or "") or None,
         "steps": steps,
     }
+
+
+def cache_materialization_result(
+    descriptor: dict[str, Any],
+    source: dict[str, Any],
+    *,
+    ok: bool,
+    steps: list[dict[str, Any]],
+    source_cache: dict[str, Any],
+    failure: str | None = None,
+    cache_worktree: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": ok,
+        "type": "git",
+        "url": descriptor["canonical_url"],
+        "ref": source.get("ref"),
+        "commit": descriptor["commit"] if ok else None,
+        "token_env": str(source.get("token_env") or "") or None,
+        "steps": steps,
+        "source_cache": source_cache,
+    }
+    if failure:
+        result["failure"] = failure
+    if cache_worktree:
+        result["_cache_worktree"] = cache_worktree
+    return result
+
+
+def materialize_cached_git_source(
+    source: dict[str, Any],
+    descriptor: dict[str, Any],
+    workspace_dir: Path,
+    task_dir: Path,
+    timeout: int,
+    cache_root: Path,
+    cache_max_bytes: int,
+) -> dict[str, Any]:
+    """Materialize a pinned commit through a local mirror and fresh worktree."""
+    started = time.monotonic()
+    cache_key = str(descriptor["cache_key"])
+    steps: list[dict[str, Any]] = []
+    cache_state = "miss"
+    hit = False
+    repaired = False
+    transferred_bytes = 0
+    eviction = {"entries": [], "bytes": 0, "over_limit": False}
+
+    def facts() -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "immutable": True,
+            "key": cache_key,
+            "hit": hit,
+            "state": cache_state,
+            "repaired": repaired,
+            "transferred_bytes": transferred_bytes,
+            "materialization_seconds": round(time.monotonic() - started, 4),
+            "evicted_entries": list(eviction["entries"]),
+            "evicted_bytes": int(eviction["bytes"]),
+            "over_limit": bool(eviction["over_limit"]),
+        }
+
+    def fill_cache(entry: Path, repo_dir: Path, metadata_path: Path, *, prefix: str) -> tuple[bool, str | None]:
+        nonlocal transferred_bytes
+        shutil.rmtree(entry, ignore_errors=True)
+        entry.mkdir(parents=True, exist_ok=True)
+        ok, clone_steps, failure = clone_git_mirror(source, repo_dir, task_dir, timeout, step_prefix=prefix)
+        steps.extend(clone_steps)
+        if not ok:
+            return False, failure
+        redact_origin = run_process(
+            ["git", "--git-dir", str(repo_dir), "remote", "set-url", "origin", descriptor["canonical_url"]],
+            cwd=entry,
+            timeout=timeout,
+        )
+        steps.append(write_command_logs(task_dir, f"{prefix}-redact-origin", redact_origin))
+        if redact_origin.returncode != 0:
+            shutil.rmtree(entry, ignore_errors=True)
+            return False, "git_cache_redaction_failed"
+        if not cached_git_repo_valid(repo_dir, str(descriptor["commit"]), timeout=timeout):
+            shutil.rmtree(entry, ignore_errors=True)
+            return False, "git_commit_not_available"
+        transferred_bytes = directory_bytes(entry)
+        write_json(
+            metadata_path,
+            {
+                "schema_version": 1,
+                "descriptor": descriptor,
+                "created_at": utc_now(),
+                "last_used_at": utc_now(),
+            },
+        )
+        return True, None
+
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        entry, repo_dir, metadata_path = cache_entry_paths(cache_root, cache_key)
+        with source_cache_lock(cache_root, cache_key):
+            hit = cached_git_repo_valid(repo_dir, str(descriptor["commit"]), timeout=timeout)
+            if hit:
+                cache_state = "hit"
+            else:
+                repaired = repo_dir.exists()
+                cache_state = "repaired" if repaired else "miss"
+                if repaired and cache_repo_has_active_worktrees(repo_dir):
+                    return cache_materialization_result(
+                        descriptor,
+                        source,
+                        ok=False,
+                        steps=steps,
+                        source_cache=facts(),
+                        failure="source_cache_busy_or_corrupt",
+                    )
+                filled, failure = fill_cache(entry, repo_dir, metadata_path, prefix="materialize-cache")
+                if not filled:
+                    return cache_materialization_result(
+                        descriptor,
+                        source,
+                        ok=False,
+                        steps=steps,
+                        source_cache=facts(),
+                        failure=failure,
+                    )
+
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+            worktree = run_process(
+                ["git", "--git-dir", str(repo_dir), "worktree", "add", "--detach", "--force", str(workspace_dir), str(descriptor["commit"])],
+                cwd=task_dir,
+                timeout=timeout,
+            )
+            steps.append(write_command_logs(task_dir, "materialize-cache-worktree", worktree))
+            if worktree.returncode != 0 and hit and not cache_repo_has_active_worktrees(repo_dir):
+                repaired = True
+                cache_state = "repaired"
+                filled, failure = fill_cache(entry, repo_dir, metadata_path, prefix="materialize-cache-repair")
+                if filled:
+                    shutil.rmtree(workspace_dir, ignore_errors=True)
+                    worktree = run_process(
+                        ["git", "--git-dir", str(repo_dir), "worktree", "add", "--detach", "--force", str(workspace_dir), str(descriptor["commit"])],
+                        cwd=task_dir,
+                        timeout=timeout,
+                    )
+                    steps.append(write_command_logs(task_dir, "materialize-cache-worktree-retry", worktree))
+            if worktree.returncode != 0:
+                return cache_materialization_result(
+                    descriptor,
+                    source,
+                    ok=False,
+                    steps=steps,
+                    source_cache=facts(),
+                    failure="source_cache_worktree_failed",
+                )
+            metadata = read_cache_json(metadata_path)
+            metadata.update({"schema_version": 1, "descriptor": descriptor, "last_used_at": utc_now()})
+            write_json(metadata_path, metadata)
+        eviction = evict_source_cache(cache_root, cache_max_bytes, keep_key=cache_key)
+        return cache_materialization_result(
+            descriptor,
+            source,
+            ok=True,
+            steps=steps,
+            source_cache=facts(),
+            cache_worktree={
+                "repo_dir": str(repo_dir),
+                "workspace_dir": str(workspace_dir),
+                "cache_root": str(cache_root),
+                "cache_max_bytes": str(cache_max_bytes),
+                "cache_key": cache_key,
+            },
+        )
+    except TimeoutError:
+        return cache_materialization_result(
+            descriptor,
+            source,
+            ok=False,
+            steps=steps,
+            source_cache=facts(),
+            failure="source_cache_lock_timeout",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return cache_materialization_result(
+            descriptor,
+            source,
+            ok=False,
+            steps=steps,
+            source_cache=facts(),
+            failure="source_cache_materialization_error",
+        )
 
 
 def materialize_local_source(source: dict[str, Any], workspace_dir: Path) -> dict[str, Any]:
@@ -518,7 +900,17 @@ def materialize_local_source(source: dict[str, Any], workspace_dir: Path) -> dic
     return {"ok": True, "type": "local", "path": str(src), "commit": commit, "ignored": sorted(ignore_names)}
 
 
-def materialize_workspace(payload: dict[str, Any], task_dir: Path) -> tuple[Path, dict[str, Any]]:
+def public_materialization(materialized: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in materialized.items() if not key.startswith("_")}
+
+
+def materialize_workspace(
+    payload: dict[str, Any],
+    task_dir: Path,
+    *,
+    source_cache_dir: Path | None = None,
+    source_cache_max_bytes: int = 0,
+) -> tuple[Path, dict[str, Any]]:
     source = dict(payload.get("source") or {})
     if not source and (payload.get("repo_url") or payload.get("ref")):
         source = {"type": "git", "url": payload.get("repo_url"), "ref": payload.get("ref")}
@@ -528,59 +920,143 @@ def materialize_workspace(payload: dict[str, Any], task_dir: Path) -> tuple[Path
         shutil.rmtree(workspace_dir)
     timeout = int(payload.get("materialize_timeout_seconds") or payload.get("timeout_seconds") or 600)
     if source_type in {"git", "repo"}:
-        materialized = materialize_git_source(source, workspace_dir, task_dir, timeout)
+        descriptor = git_source_descriptor(source)
+        advertised_key = source_cache_key(payload)
+        expected_key = str(descriptor["cache_key"]) if descriptor else None
+        if descriptor and source_cache_dir and source_cache_max_bytes > 0 and advertised_key in {None, expected_key}:
+            materialized = materialize_cached_git_source(
+                source,
+                descriptor,
+                workspace_dir,
+                task_dir,
+                timeout,
+                source_cache_dir,
+                source_cache_max_bytes,
+            )
+            if not materialized.get("ok") and materialized.get("failure") != "transient_git_network_error":
+                cache_facts = dict(materialized.get("source_cache") or {})
+                shutil.rmtree(workspace_dir, ignore_errors=True)
+                fallback = materialize_git_source(source, workspace_dir, task_dir, timeout)
+                fallback_steps = list(materialized.get("steps") or []) + list(fallback.get("steps") or [])
+                cache_facts["fallback"] = "fresh_clone"
+                cache_facts["cache_failure"] = materialized.get("failure")
+                fallback["steps"] = fallback_steps
+                fallback["source_cache"] = cache_facts
+                materialized = fallback
+        else:
+            materialized = materialize_git_source(source, workspace_dir, task_dir, timeout)
+            reason = "disabled_by_runner"
+            if descriptor is None:
+                reason = "immutable_git_commit_required"
+            elif advertised_key not in {None, expected_key}:
+                reason = "descriptor_mismatch"
+            materialized["source_cache"] = {"enabled": False, "reason": reason}
     elif source_type == "local":
         materialized = materialize_local_source(source, workspace_dir)
+        materialized["source_cache"] = {"enabled": False, "reason": "source_type_not_cacheable"}
     else:
         raise ValueError(f"unsupported source type: {source_type}")
-    write_json(task_dir / "source-summary.json", materialized)
+    write_json(task_dir / "source-summary.json", public_materialization(materialized))
     return workspace_dir, materialized
 
 
-def run_repo_task(payload: dict[str, Any], task_dir: Path) -> dict[str, Any]:
-    workspace_dir, materialized = materialize_workspace(payload, task_dir)
+def cleanup_cached_workspace(materialized: dict[str, Any], task_dir: Path) -> None:
+    cache_worktree = materialized.pop("_cache_worktree", None)
+    if not isinstance(cache_worktree, dict):
+        return
+    repo_dir = Path(str(cache_worktree.get("repo_dir") or ""))
+    workspace_dir = Path(str(cache_worktree.get("workspace_dir") or ""))
+    if not repo_dir.is_dir() or not workspace_dir.exists():
+        return
+    try:
+        cleanup = run_process(
+            ["git", "--git-dir", str(repo_dir), "worktree", "remove", "--force", str(workspace_dir)],
+            cwd=task_dir,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        cleanup = None
+    if cleanup is None or cleanup.returncode != 0:
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+        try:
+            run_process(["git", "--git-dir", str(repo_dir), "worktree", "prune"], cwd=task_dir, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        eviction = evict_source_cache(
+            Path(str(cache_worktree.get("cache_root") or "")),
+            int(str(cache_worktree.get("cache_max_bytes") or "0")),
+            keep_key=str(cache_worktree.get("cache_key") or ""),
+        )
+    except (OSError, ValueError):
+        return
+    facts = materialized.get("source_cache")
+    if isinstance(facts, dict):
+        facts["evicted_entries"] = sorted(set((facts.get("evicted_entries") or []) + list(eviction["entries"])))
+        facts["evicted_bytes"] = int(facts.get("evicted_bytes") or 0) + int(eviction["bytes"])
+        facts["over_limit"] = bool(eviction["over_limit"])
+
+
+def run_repo_task(
+    payload: dict[str, Any],
+    task_dir: Path,
+    *,
+    source_cache_dir: Path | None = None,
+    source_cache_max_bytes: int = 0,
+) -> dict[str, Any]:
+    workspace_dir, materialized = materialize_workspace(
+        payload,
+        task_dir,
+        source_cache_dir=source_cache_dir,
+        source_cache_max_bytes=source_cache_max_bytes,
+    )
     command_results: list[dict[str, Any]] = []
     exit_code = 0 if materialized.get("ok") else 2
     commands = command_list(payload)
-    if exit_code == 0:
-        for idx, spec in enumerate(commands, start=1):
-            command = command_with_args(spec)
-            if not command:
-                continue
-            timeout = int(spec.get("timeout_seconds") or payload.get("timeout_seconds") or 300)
-            rel_cwd = str(spec.get("cwd") or ".")
-            if Path(rel_cwd).is_absolute() or ".." in Path(rel_cwd).parts:
-                raise ValueError(f"command cwd must be relative and stay inside workspace: {rel_cwd}")
-            cwd = workspace_dir / rel_cwd
-            proc = run_process(command, cwd=cwd, timeout=timeout, env=build_env(payload, spec))
-            command_result = write_command_logs(task_dir, f"{idx:02d}-{spec.get('name')}", proc)
-            command_result["cwd"] = rel_cwd
-            command_result["phase"] = str(spec.get("phase") or spec.get("name") or f"command-{idx:02d}")
-            command_result["phase_index"] = int(spec.get("phase_index") or idx)
-            command_result["timeout_seconds"] = timeout
-            command_results.append(command_result)
-            if proc.returncode != 0:
-                exit_code = int(proc.returncode)
-                continue_on_error = (
-                    bool(spec["continue_on_error"])
-                    if "continue_on_error" in spec
-                    else bool(payload.get("continue_on_error"))
-                )
-                if not continue_on_error:
-                    break
-    phase_report = {
-        "schema_version": 1,
-        "task_id": str((payload.get("_loom_runtime_env") or {}).get("LOOM_TASK_ID") or ""),
-        "attempt_no": int((payload.get("_loom_runtime_env") or {}).get("LOOM_ATTEMPT_NO") or 1),
-        "phases": command_results,
-    }
-    write_json(task_dir / "phase-results.json", phase_report)
-    artifact_patterns = [str(p) for p in payload.get("artifact_paths") or payload.get("artifacts") or []]
-    for spec in commands:
-        artifact_patterns.extend(str(pattern) for pattern in spec.get("artifact_paths") or [])
-    artifacts = collect_artifacts(workspace_dir, task_dir, artifact_patterns) if workspace_dir.exists() else []
+    artifacts: list[dict[str, Any]] = []
+    try:
+        if exit_code == 0:
+            for idx, spec in enumerate(commands, start=1):
+                command = command_with_args(spec)
+                if not command:
+                    continue
+                timeout = int(spec.get("timeout_seconds") or payload.get("timeout_seconds") or 300)
+                rel_cwd = str(spec.get("cwd") or ".")
+                if Path(rel_cwd).is_absolute() or ".." in Path(rel_cwd).parts:
+                    raise ValueError(f"command cwd must be relative and stay inside workspace: {rel_cwd}")
+                cwd = workspace_dir / rel_cwd
+                proc = run_process(command, cwd=cwd, timeout=timeout, env=build_env(payload, spec))
+                command_result = write_command_logs(task_dir, f"{idx:02d}-{spec.get('name')}", proc)
+                command_result["cwd"] = rel_cwd
+                command_result["phase"] = str(spec.get("phase") or spec.get("name") or f"command-{idx:02d}")
+                command_result["phase_index"] = int(spec.get("phase_index") or idx)
+                command_result["timeout_seconds"] = timeout
+                command_results.append(command_result)
+                if proc.returncode != 0:
+                    exit_code = int(proc.returncode)
+                    continue_on_error = (
+                        bool(spec["continue_on_error"])
+                        if "continue_on_error" in spec
+                        else bool(payload.get("continue_on_error"))
+                    )
+                    if not continue_on_error:
+                        break
+        phase_report = {
+            "schema_version": 1,
+            "task_id": str((payload.get("_loom_runtime_env") or {}).get("LOOM_TASK_ID") or ""),
+            "attempt_no": int((payload.get("_loom_runtime_env") or {}).get("LOOM_ATTEMPT_NO") or 1),
+            "phases": command_results,
+        }
+        write_json(task_dir / "phase-results.json", phase_report)
+        artifact_patterns = [str(p) for p in payload.get("artifact_paths") or payload.get("artifacts") or []]
+        for spec in commands:
+            artifact_patterns.extend(str(pattern) for pattern in spec.get("artifact_paths") or [])
+        artifacts = collect_artifacts(workspace_dir, task_dir, artifact_patterns) if workspace_dir.exists() else []
+    finally:
+        cleanup_cached_workspace(materialized, task_dir)
+        write_json(task_dir / "source-summary.json", public_materialization(materialized))
     return {
-        "materialized": materialized,
+        "materialized": public_materialization(materialized),
         "commands": command_results,
         "phases": command_results,
         "artifacts": artifacts,
@@ -601,7 +1077,13 @@ def zip_task_dir(task_dir: Path, zip_path: Path) -> None:
                 z.write(item, rel.as_posix())
 
 
-def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any]]:
+def run_task(
+    task: dict[str, Any],
+    work_root: Path,
+    *,
+    source_cache_dir: Path | None = None,
+    source_cache_max_bytes: int = 0,
+) -> tuple[Path, dict[str, Any]]:
     task_id = task["task_id"]
     payload = dict(task.get("payload") or {})
     normalized = payload.get("normalized") if isinstance(payload.get("normalized"), dict) else {}
@@ -630,6 +1112,7 @@ def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any
     stderr = ""
     exit_code = 0
     measurement_records: list[dict[str, Any]] = []
+    repo_result: dict[str, Any] | None = None
     try:
         if runner == "shell":
             command = shell_command(payload)
@@ -641,7 +1124,12 @@ def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any
             if isinstance(usage, dict):
                 measurement_records.append({"resource_usage": usage})
         elif runner == "repo":
-            repo_result = run_repo_task(payload, task_dir)
+            repo_result = run_repo_task(
+                payload,
+                task_dir,
+                source_cache_dir=source_cache_dir,
+                source_cache_max_bytes=source_cache_max_bytes,
+            )
             stdout = json.dumps(repo_result, ensure_ascii=False, indent=2) + "\n"
             stderr = ""
             exit_code = int(repo_result["exit_code"])
@@ -684,6 +1172,7 @@ def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any
     if runner == "repo":
         result["repo_result_path"] = "stdout.txt"
         result["phase_result_path"] = "phase-results.json"
+        result["source_cache"] = (repo_result or {}).get("materialized", {}).get("source_cache", {})
     if normalized:
         result["normalized"] = normalized
     if "extensions" in payload:
@@ -696,6 +1185,28 @@ def run_task(task: dict[str, Any], work_root: Path) -> tuple[Path, dict[str, Any
 
 def controller_token(args: argparse.Namespace) -> str | None:
     return getattr(args, "controller_token", None)
+
+
+def runner_source_cache_settings(args: argparse.Namespace, work_root: Path | None = None) -> tuple[Path, int]:
+    root = work_root or Path(getattr(args, "work_dir", Path("loom-runs/runner")))
+    configured = getattr(args, "source_cache_dir", None)
+    cache_root = Path(configured).expanduser() if configured else root / "source-cache"
+    try:
+        max_mb = int(getattr(args, "source_cache_max_mb", DEFAULT_SOURCE_CACHE_MAX_MB))
+    except (TypeError, ValueError):
+        max_mb = DEFAULT_SOURCE_CACHE_MAX_MB
+    return cache_root, max(0, max_mb) * 1024 * 1024
+
+
+def runner_source_cache_health(args: argparse.Namespace, work_root: Path | None = None) -> dict[str, Any]:
+    cache_root, max_bytes = runner_source_cache_settings(args, work_root)
+    inventory = source_cache_inventory(cache_root)
+    inventory["enabled"] = max_bytes > 0
+    inventory["max_bytes"] = max_bytes
+    if max_bytes <= 0:
+        inventory["keys"] = []
+        inventory["keys_truncated"] = False
+    return inventory
 
 
 class LeaseRenewer:
@@ -761,6 +1272,7 @@ def heartbeat(args: argparse.Namespace, current_runs: list[dict[str, Any]], phas
                 "hostname": socket.gethostname(),
                 "platform": platform.platform(),
                 "resources": resource_snapshot(),
+                "source_cache": runner_source_cache_health(args),
                 "time": utc_now(),
             },
         },
@@ -781,7 +1293,12 @@ def register(args: argparse.Namespace) -> dict[str, Any]:
             "concurrency_policy": args.concurrency_policy,
             "resource_capacity": configured_resource_capacity(args, snapshot),
             "runner_api_version": RUNNER_API_VERSION,
-            "health": {"hostname": socket.gethostname(), "platform": platform.platform(), "resources": snapshot},
+            "health": {
+                "hostname": socket.gethostname(),
+                "platform": platform.platform(),
+                "resources": snapshot,
+                "source_cache": runner_source_cache_health(args),
+            },
         },
         token=controller_token(args),
     )
@@ -809,7 +1326,13 @@ def handle_one(args: argparse.Namespace, work_root: Path) -> bool:
     try:
         current[0]["phase"] = "running"
         heartbeat(args, current, "running")
-        zip_path, result = run_task(task, work_root)
+        source_cache_dir, source_cache_max_bytes = runner_source_cache_settings(args, work_root)
+        zip_path, result = run_task(
+            task,
+            work_root,
+            source_cache_dir=source_cache_dir,
+            source_cache_max_bytes=source_cache_max_bytes,
+        )
         current[0]["phase"] = "uploading"
         heartbeat(args, current, "uploading")
         upload = upload_file(args.controller, task_id, args.worker_id, zip_path, token=controller_token(args))
@@ -873,7 +1396,13 @@ def execute_claimed_task(args: argparse.Namespace, work_root: Path, task: dict[s
     lease_renewer = LeaseRenewer(args, task_id)
     lease_renewer.start()
     try:
-        zip_path, result = run_task(task, work_root)
+        source_cache_dir, source_cache_max_bytes = runner_source_cache_settings(args, work_root)
+        zip_path, result = run_task(
+            task,
+            work_root,
+            source_cache_dir=source_cache_dir,
+            source_cache_max_bytes=source_cache_max_bytes,
+        )
         upload = upload_file(args.controller, task_id, args.worker_id, zip_path, token=controller_token(args))
         if not (upload.get("auto_retry") or {}).get("queued"):
             request_json(
@@ -1035,6 +1564,7 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
                     "last_result": self.server.last_result,
                     "resources": resource_snapshot(),
                     "resource_capacity": configured_resource_capacity(self.server.worker_args),
+                    "source_cache": runner_source_cache_health(self.server.worker_args, self.server.work_root),
                 },
             )
             return
@@ -1050,6 +1580,7 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
                     "initial_concurrency": self.server.worker_args.initial_concurrency,
                     "max_concurrency": self.server.worker_args.max_concurrency,
                     "resource_capacity": configured_resource_capacity(self.server.worker_args),
+                    "source_cache": runner_source_cache_health(self.server.worker_args, self.server.work_root),
                 },
             )
             return
@@ -1209,6 +1740,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--worker-id", default=f"worker-{socket.gethostname()}-{uuid.uuid4().hex[:8]}")
     parser.add_argument("--capability", action="append", default=[])
     parser.add_argument("--work-dir", type=Path, default=Path("loom-runs/runner"))
+    parser.add_argument("--source-cache-dir", type=Path, default=None, help="Runner-local cache for immutable Git sources. Defaults to WORK_DIR/source-cache.")
+    parser.add_argument("--source-cache-max-mb", type=int, default=DEFAULT_SOURCE_CACHE_MAX_MB, help="Maximum source-cache budget in MiB; 0 disables cache reuse.")
     parser.add_argument("--poll-seconds", type=int, default=5)
     parser.add_argument("--lease-seconds", type=int, default=600)
     parser.add_argument("--max-concurrency", type=int, default=1, help="Hard worker-side concurrency cap. The controller chooses the active desired concurrency.")
@@ -1250,6 +1783,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.claim_wait_seconds = 25
     if args.connection_mode == "poll":
         args.claim_wait_seconds = max(0, args.claim_wait_seconds)
+    if args.source_cache_max_mb < 0:
+        raise ValueError("source_cache_max_mb must be non-negative")
     return args
 
 
@@ -1257,6 +1792,12 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     args.work_dir = args.work_dir.expanduser().resolve()
     args.work_dir.mkdir(parents=True, exist_ok=True)
+    if args.source_cache_dir is None:
+        args.source_cache_dir = args.work_dir / "source-cache"
+    else:
+        args.source_cache_dir = args.source_cache_dir.expanduser().resolve()
+    if args.source_cache_max_mb > 0:
+        args.source_cache_dir.mkdir(parents=True, exist_ok=True)
     if args.connection_mode == "direct-api":
         return serve_direct_api(args, args.work_dir)
     register(args)

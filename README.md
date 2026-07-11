@@ -15,7 +15,8 @@ ZIPs.
 [Remote quick start](#remote-quick-start) |
 [Manifest](docs/TASK_MANIFEST.md) |
 [Architecture](docs/ARCHITECTURE.md) |
-[v0.2 release and protocol versions](docs/VERSIONING.md) |
+[v0.3 release and protocol versions](docs/VERSIONING.md) |
+[Source cache and affinity](docs/CACHE_AFFINITY.md) |
 [Release contract](docs/RELEASE_CONTRACT.md) |
 [Support scope](docs/SCOPE.md)
 
@@ -35,7 +36,7 @@ execution flow.
 - **Resource-aware shared-host admission.** A task can reserve CPU, memory,
   disk, and accelerators before it is leased, while `shared` and `exclusive`
   placement make host multiplexing explicit instead of accidental.
-- **Frozen Core Preview v0.2 contracts.** Versioned inventory, manifest, dispatch,
+- **Frozen Core Preview v0.3 contracts.** Versioned inventory, manifest, dispatch,
   token, CLI, and capability-query contracts keep downstream automation on a
   documented surface rather than internal Python helpers.
 - **Remote worker connections that persist.** Bootstrap workers once over SSH,
@@ -51,6 +52,10 @@ execution flow.
 - **Integration-owned metadata.** Optional namespaced `extensions` flow from a
   campaign into recovered task and worker-result records without becoming a
   hidden scheduling or provider contract.
+- **Cache-aware source reuse.** Immutable Git commits can reuse a bounded
+  Runner-local mirror while every attempt still receives an isolated writable
+  workspace. Hub treats a local cache hit as a scheduling preference, never as
+  a requirement.
 - **A small operating footprint.** The implementation uses the Python standard
   library and a SQLite-backed controller; no package installation is required.
 
@@ -163,6 +168,8 @@ Repository tasks describe a source checkout, ordered commands, timeouts, and an
 explicit artifact allowlist. Loom Runners materialize the source in a per-task
 workspace, then upload only metadata, command logs, and requested artifacts.
 Full source checkouts are deliberately excluded from result packages.
+Pinned Git sources may use a Runner-local cache; see [Source Cache And Cache
+Affinity](docs/CACHE_AFFINITY.md) for the descriptor and scheduling contract.
 
 See [Loom Manifest](docs/TASK_MANIFEST.md) for the full JSON/JSONL
 schema and [Architecture](docs/ARCHITECTURE.md#repo-task-delivery) for the
@@ -176,6 +183,7 @@ delivery protocol.
 | [Versioning](docs/VERSIONING.md) | When deciding whether a change belongs in a patch, product release, or protocol version. |
 | [Loom Manifest](docs/TASK_MANIFEST.md) | When preparing a campaign, retry policy, private source, or expected-result contract. |
 | [Resource Admission](docs/RESOURCE_ADMISSION.md) | When sharing existing workers safely with declared task resource requests. |
+| [Source Cache And Cache Affinity](docs/CACHE_AFFINITY.md) | When reusing pinned Git sources or inspecting cache-local scheduling. |
 | [Release Contract](docs/RELEASE_CONTRACT.md) | When changing phases, Direct Runner delivery, authentication, result retention, or release gates. |
 | [AgentDojo Release Fixture](docs/AGENTDOJO_EXAMPLE.md) | When running or inspecting the fixed 2-case x 2-run x 2-attempt remote regression. |
 | [Architecture](docs/ARCHITECTURE.md) | When integrating the Hub, Runner, connection modes, concurrency behavior, or result APIs. |
@@ -185,6 +193,7 @@ delivery protocol.
 
 ```text
 tools/loom_hub.py                # Loom Hub API, SQLite state, and CLI
+tools/loom_cache.py              # Immutable Git source descriptors
 tools/loom_runner.py             # Loom Runner
 tools/loom_manifest.py           # Loom Manifest normalizer
 tools/loom_matrix.py             # Loom Matrix remote runner

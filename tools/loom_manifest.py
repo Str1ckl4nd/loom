@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from loom_cache import attach_source_descriptor
 from loom_contract import CORE_PREVIEW_VERSION, MANIFEST_SCHEMA_VERSION, merge_extensions
 from loom_resources import normalize_execution_profile
 
@@ -321,6 +322,7 @@ def normalize(
             if not task_source:
                 raise ValueError(f"repo run row {index} requires source")
             payload["source"] = expand_template(task_source, context)
+            attach_source_descriptor(payload)
             phases = phase_specs(defaults, case, context)
             if phases:
                 payload["phases"] = phases

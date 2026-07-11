@@ -116,6 +116,15 @@ becomes non-active. This is a scheduling reservation, not a container, cgroup,
 or security boundary. [Resource Admission](RESOURCE_ADMISSION.md) defines the
 public fields and inspection APIs.
 
+### Source Cache Affinity
+
+For a pinned Git commit, Runner maintains a bounded local mirror and makes a
+fresh writable worktree per attempt. Its heartbeat advertises only the derived
+cache keys. Hub ranks a matching key as a soft preference after priority; it
+does not turn a miss into an admission failure. The same rule applies when Hub
+automatically selects a Direct Runner for Push. Hub never stores cached source
+data. See [Source Cache And Cache Affinity](CACHE_AFFINITY.md).
+
 ## Repo Task Delivery
 
 The V1 repository contract is phase-oriented:

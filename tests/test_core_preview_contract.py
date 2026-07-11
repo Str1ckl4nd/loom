@@ -31,6 +31,8 @@ class CorePreviewContractTests(unittest.TestCase):
                     "max_concurrency": 4,
                     "initial_concurrency": 3,
                     "concurrency_policy": "fixed",
+                    "source_cache_dir": "/srv/loom/cache",
+                    "source_cache_max_mb": 2048,
                 }
             ],
         }
@@ -42,6 +44,8 @@ class CorePreviewContractTests(unittest.TestCase):
         self.assertEqual(worker["initial_concurrency"], 3)
         self.assertEqual(worker["max_concurrency"], 4)
         self.assertEqual(worker["concurrency_policy"], "fixed")
+        self.assertEqual(worker["source_cache_dir"], "/srv/loom/cache")
+        self.assertEqual(worker["source_cache_max_mb"], 2048)
 
     def test_inventory_v1_rejects_initial_above_hard_max(self) -> None:
         inventory = {
@@ -97,6 +101,17 @@ class CorePreviewContractTests(unittest.TestCase):
                     "2",
                     "--initial-concurrency",
                     "3",
+                ]
+            )
+
+    def test_runner_rejects_a_negative_source_cache_budget(self) -> None:
+        with self.assertRaisesRegex(ValueError, "source_cache_max_mb"):
+            loom_runner.parse_args(
+                [
+                    "--controller",
+                    "http://127.0.0.1:8765",
+                    "--source-cache-max-mb",
+                    "-1",
                 ]
             )
 

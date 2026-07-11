@@ -1,11 +1,11 @@
-# Core Preview v0.2 Compatibility
+# Core Preview v0.3 Compatibility
 
-Loom Core Preview v0.2 freezes its public integration surface around versioned
+Loom Core Preview v0.3 freezes its public integration surface around versioned
 files, command-line entry points, and authenticated HTTP metadata. Downstream
 automation must use this surface. Importing a function from a file under
 `tools/` is not a supported integration and carries no compatibility promise.
 
-The product release is `v0.2.0`; the inventory, manifest, dispatch, Hub API,
+The product release is `v0.3.0`; the inventory, manifest, dispatch, Hub API,
 and Runner API contracts remain independently versioned at `v1`.
 
 ## Version Discovery
@@ -36,7 +36,10 @@ curl -sS -H "Authorization: Bearer $LOOM_RUNNER_TOKEN" \
 The document includes Core Preview version, CLI contract version, supported
 inventory/manifest/dispatch versions, API version, and advertised capabilities.
 Hub and Runner advertise `task-extensions-v1` when they preserve optional
-user-owned `extensions` metadata end to end.
+user-owned `extensions` metadata end to end. Manifest, Hub, and Runner also
+advertise immutable-source and cache capabilities when an immutable Git source
+can be reused locally; inspect `capabilities` rather than importing `tools/`
+functions.
 
 ## Frozen File Contracts
 
@@ -69,6 +72,7 @@ The smallest valid v1 inventory shape is:
       "max_concurrency": 4,
       "initial_concurrency": 2,
       "concurrency_policy": "fixed",
+      "source_cache_max_mb": 4096,
       "capabilities": ["linux"]
     }
   ]
@@ -105,6 +109,16 @@ not turn those values into an operating-system isolation boundary.
 headroom. `GET /api/data/task-admission?task_id=...` explains a task's current
 eligibility per worker. The `worker-capacity` and `task-admission` Hub CLI
 subcommands expose the same authenticated views.
+
+## Immutable Source Cache
+
+An immutable Git source with a complete commit receives the additive
+`payload.source_descriptor` field. It gives a Runner a credential-free cache
+identity; mutable refs do not receive one. A Runner reports its bounded local
+cache through heartbeats, and Hub uses an available matching key only as a soft
+same-priority scheduling preference. `GET /api/data/worker-cache`, the
+`worker-cache` CLI command, and task-admission output expose the relevant
+facts. See [Source Cache And Cache Affinity](CACHE_AFFINITY.md).
 
 ## Token And Startup Contract
 

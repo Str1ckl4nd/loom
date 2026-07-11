@@ -12,6 +12,7 @@ sys.path.insert(0, str(TOOLS))
 
 import loom_hub
 import loom_manifest
+from loom_cache import git_source_descriptor
 from loom_http import request_json
 
 
@@ -174,6 +175,85 @@ class ResourceAdmissionTests(unittest.TestCase):
         self.assertEqual(worker["reason"], "worker_concurrency_reached")
         self.assertEqual(worker["concurrency"]["leased_active"], 1)
         self.assertEqual(worker["concurrency"]["active_count"], 1)
+
+    def test_pull_claim_prefers_a_cache_hit_without_overriding_priority(self) -> None:
+        cached_source = {
+            "type": "git",
+            "url": "https://example.test/acme/cached.git",
+            "commit": "a" * 40,
+        }
+        missed_source = {
+            "type": "git",
+            "url": "https://example.test/acme/missed.git",
+            "commit": "b" * 40,
+        }
+        cached_descriptor = git_source_descriptor(cached_source)
+        self.assertIsNotNone(cached_descriptor)
+        request_json(
+            self.controller + "/api/workers/heartbeat",
+            {
+                "worker_id": "reserved-worker",
+                "current_runs": [],
+                "health": {
+                    "source_cache": {
+                        "enabled": True,
+                        "entry_count": 1,
+                        "bytes": 123,
+                        "max_bytes": 1024,
+                        "keys": [cached_descriptor["cache_key"]],
+                    }
+                },
+            },
+            token=self.token,
+        )
+        profile = {"placement": "shared", "resources": {"cpu_millis": 100, "memory_mb": 64}}
+        request_json(
+            self.controller + "/api/tasks/dispatch",
+            {
+                "schema_version": 1,
+                "operator": "resource-test",
+                "tasks": [
+                    {
+                        "task_id": "high-priority-cache-miss",
+                        "required_capability": "linux",
+                        "priority": 10,
+                        "payload": {"runner": "repo", "source": missed_source, "execution_profile": profile},
+                    },
+                    {
+                        "task_id": "cache-miss-created-first",
+                        "required_capability": "linux",
+                        "payload": {"runner": "repo", "source": missed_source, "execution_profile": profile},
+                    },
+                    {
+                        "task_id": "cache-hit-created-second",
+                        "required_capability": "linux",
+                        "payload": {"runner": "repo", "source": cached_source, "execution_profile": profile},
+                    },
+                ],
+            },
+            token=self.token,
+        )
+
+        high_priority_claim = request_json(
+            self.controller + "/api/tasks/claim",
+            {"worker_id": "reserved-worker", "limit": 1, "lease_seconds": 120},
+            token=self.token,
+        )
+        self.assertEqual([task["task_id"] for task in high_priority_claim["tasks"]], ["high-priority-cache-miss"])
+        claim = request_json(
+            self.controller + "/api/tasks/claim",
+            {"worker_id": "reserved-worker", "limit": 1, "lease_seconds": 120},
+            token=self.token,
+        )
+
+        self.assertEqual([task["task_id"] for task in claim["tasks"]], ["cache-hit-created-second"])
+        affinity = claim["tasks"][0]["controller_concurrency"]["cache_affinity"]
+        self.assertTrue(affinity["cache_hit"])
+        admission = request_json(
+            self.controller + "/api/data/task-admission?task_id=cache-hit-created-second",
+            token=self.token,
+        )
+        self.assertTrue(admission["workers"][0]["cache_affinity"]["cache_hit"])
 
 
 if __name__ == "__main__":

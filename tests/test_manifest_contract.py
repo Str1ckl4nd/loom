@@ -9,6 +9,7 @@ TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
 
 import loom_manifest
+from loom_cache import attach_source_descriptor, git_source_descriptor
 
 
 class ManifestContractTests(unittest.TestCase):
@@ -137,6 +138,61 @@ class ManifestContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "defaults.extensions must be an object"):
             loom_manifest.normalize(manifest, operator="test")
+
+    def test_immutable_git_source_gets_a_credential_free_cache_descriptor(self) -> None:
+        commit = "a" * 40
+        manifest = {
+            "schema_version": 1,
+            "campaign_id": "immutable-source",
+            "source": {
+                "type": "git",
+                "url": "https://user:secret@example.test/org/repo.git/",
+                "resolved_commit": commit,
+            },
+            "defaults": {"runner": "repo", "commands": ["true"]},
+            "cases": [{"case_id": "case-a", "setting_id": "baseline", "run_id": "001"}],
+        }
+
+        task = loom_manifest.normalize(manifest, operator="test")["tasks"][0]
+        descriptor = task["payload"]["source_descriptor"]
+
+        self.assertEqual(descriptor["type"], "git")
+        self.assertEqual(descriptor["commit"], commit)
+        self.assertEqual(descriptor["canonical_url"], "https://example.test/org/repo.git")
+        self.assertTrue(descriptor["cache_key"].startswith("git-sha256:"))
+        self.assertNotIn("secret", str(descriptor))
+
+    def test_mutable_git_ref_does_not_advertise_cache_reuse(self) -> None:
+        manifest = {
+            "schema_version": 1,
+            "campaign_id": "mutable-source",
+            "source": {"type": "git", "url": "https://example.test/org/repo.git", "ref": "main"},
+            "defaults": {"runner": "repo", "commands": ["true"]},
+            "cases": [{"case_id": "case-a", "setting_id": "baseline", "run_id": "001"}],
+        }
+
+        task = loom_manifest.normalize(manifest, operator="test")["tasks"][0]
+
+        self.assertNotIn("source_descriptor", task["payload"])
+
+    def test_raw_descriptor_must_match_every_immutable_source_field(self) -> None:
+        source = {
+            "type": "git",
+            "url": "https://example.test/org/repo.git",
+            "commit": "b" * 40,
+        }
+        descriptor = git_source_descriptor(source)
+        self.assertIsNotNone(descriptor)
+        payload = {
+            "source": source,
+            "source_descriptor": {
+                **descriptor,
+                "canonical_url": "https://example.test/other/repo.git",
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            attach_source_descriptor(payload)
 
 
 if __name__ == "__main__":

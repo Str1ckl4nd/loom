@@ -258,6 +258,15 @@ def load_inventory(path: Path) -> dict[str, Any]:
         worker["concurrency_policy"] = policy
         if "resource_capacity" in worker:
             worker["resource_capacity"] = normalize_capacity_overrides(worker["resource_capacity"])
+        if "source_cache_max_mb" in worker:
+            try:
+                worker["source_cache_max_mb"] = int(worker["source_cache_max_mb"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"inventory worker {worker_ids[index - 1]} source_cache_max_mb must be an integer") from exc
+            if worker["source_cache_max_mb"] < 0:
+                raise ValueError(f"inventory worker {worker_ids[index - 1]} source_cache_max_mb must be non-negative")
+        if "source_cache_dir" in worker and not isinstance(worker["source_cache_dir"], str):
+            raise ValueError(f"inventory worker {worker_ids[index - 1]} source_cache_dir must be a string")
     return data
 
 
@@ -265,6 +274,7 @@ def remote_setup(host: dict[str, Any], remote_dir: str, tool_root: Path) -> None
     ssh(host, f"mkdir -p {shlex.quote(remote_dir)}")
     for name in (
         "loom_contract.py",
+        "loom_cache.py",
         "loom_http.py",
         "loom_resources.py",
         "loom_hub.py",
@@ -563,6 +573,11 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
     if mode == "direct-worker-api" and direct_dispatch_mode == "push":
         run_on_start = False
     direct_start_arg = " --direct-api-run-on-start" if worker_runtime_mode == "direct-api" and run_on_start else ""
+    source_cache_args = ""
+    if worker.get("source_cache_dir"):
+        source_cache_args += f" --source-cache-dir {shlex.quote(str(worker['source_cache_dir']))}"
+    if "source_cache_max_mb" in worker:
+        source_cache_args += f" --source-cache-max-mb {int(worker['source_cache_max_mb'])}"
     cmd = (
         f"cd {shlex.quote(remote_dir)} || exit 1; "
         f"{source_env}{env_prefix}nohup python3 loom_runner.py "
@@ -570,6 +585,7 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
         f"--worker-id {shlex.quote(worker_id)} "
         f"{cap_args} "
         f"--work-dir worker-runs/{shlex.quote(worker_id)} "
+        f"{source_cache_args} "
         f"--max-concurrency {max_concurrency} "
         f"--initial-concurrency {initial_concurrency} "
         f"--concurrency-policy {shlex.quote(concurrency_policy)} "
@@ -593,6 +609,8 @@ def start_worker(worker: dict[str, Any], controller_private_url: str, remote_dir
         "max_concurrency": max_concurrency,
         "concurrency_policy": concurrency_policy,
         "resource_capacity": worker.get("resource_capacity") or {},
+        "source_cache_dir": worker.get("source_cache_dir"),
+        "source_cache_max_mb": worker.get("source_cache_max_mb"),
     }
     if mode == "direct-worker-api":
         url = direct_worker_url(worker)
