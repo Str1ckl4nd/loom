@@ -11,6 +11,20 @@
 
 Hub is the only task-state owner. A Runner never owns an independent task queue.
 
+## Design Goal: Reuse Existing Capacity
+
+Loom treats a task attempt, not a new virtual machine or a permanently reserved
+worker, as the schedulable unit. An operator supplies the hosts; Hub combines
+per-worker concurrency with task-level resource reservations to decide whether a
+compatible attempt can share a host. This lets unrelated cases and runs make
+useful progress on spare capacity while preserving a distinct lease, attempt
+number, logs, artifacts, and result package for each execution.
+
+The model is deliberately bounded: scheduler reservations are admission
+decisions, not cgroup enforcement, and cache affinity is a preference rather
+than a requirement. Loom does not provision, resize, or own cloud instances. It
+improves utilization of the capacity an operator already has.
+
 ## Connection Modes
 
 The inventory selects a mode per Runner:

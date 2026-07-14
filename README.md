@@ -4,14 +4,17 @@
   <img src="assets/loom-banner.png" alt="Loom - Remote Agent Evaluation Orchestration" width="100%">
 </p>
 
-**Leased Orchestration for Observable Model work.**
+**Leased orchestration for high-utilization Agent evaluation.**
 
-Loom is a reliable, inventory-driven task control plane for agent evaluation.
-It dispatches normalized work across operator-owned hosts: the **Loom Hub** owns
-scheduling, leases, concurrency policy, retries, and result intake; **Loom
-Runners** execute ordered task packages and return compact, queryable result
-ZIPs.
+Loom is an inventory-driven task control plane for Agent evaluation that makes
+existing remote capacity do more useful work. Rather than making a fixed cloud
+instance the unit of scheduling, Loom leases individual evaluation attempts to
+shared, operator-owned workers with explicit resource, concurrency, cache, and
+recovery contracts. The **Loom Hub** owns scheduling, leases, retries, and
+result intake; **Loom Runners** execute ordered task packages and return compact,
+queryable result ZIPs.
 
+[Why Loom](#why-loom) |
 [Remote quick start](#remote-quick-start) |
 [Manifest](docs/TASK_MANIFEST.md) |
 [Architecture](docs/ARCHITECTURE.md) |
@@ -26,6 +29,31 @@ ZIPs.
 work**. A loom brings separate threads into one ordered fabric; Loom brings task
 definitions, available hosts, leases, and evidence packages into one recoverable
 execution flow.
+
+## Why Loom
+
+Long-running Agent evaluations often waste more wall-clock time waiting for
+available capacity than doing useful work. A whole cloud instance or worker slot
+is frequently treated as the smallest schedulable unit, leaving CPU, memory,
+accelerators, and already-fetched source idle while another experiment waits.
+
+Loom makes a task attempt the unit of control on hosts you already operate:
+
+- **Reuse shared capacity deliberately.** A task declares CPU, memory, disk, and
+  accelerator reservations; the Hub leases it only when the shared worker has
+  declared capacity. `shared` and `exclusive` placement make coexistence an
+  explicit scheduling decision.
+- **Keep the useful work moving.** Per-worker concurrency, leases, retries, and
+  fine-grained case/run/attempt identities let independent evaluation work use
+  available slots without losing its execution history.
+- **Avoid repeated setup work.** Pinned Git sources can stay in a bounded
+  Runner-local cache, while every attempt still receives a fresh writable
+  worktree. Cache affinity prefers a matching worker without making a cache miss
+  block the queue.
+
+This is not VM provisioning or cloud autoscaling. Loom begins once hosts exist
+and focuses on turning their remaining, heterogeneous capacity into observable,
+recoverable evaluation throughput.
 
 ## What You Get
 
