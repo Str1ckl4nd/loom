@@ -51,9 +51,13 @@
 - [x] Report cache key, hit/miss, transferred bytes, materialization time, and
   eviction facts in Runner results and Hub queries without exposing source
   credentials or turning Hub into a required blob store.
-- [ ] Extend the fixed remote release gate with same-digest reuse, changed-
-  digest refresh, and corrupt-cache recovery checks, then benchmark the
-  network, wall-clock, disk, and queueing impact on existing hosts.
+- [x] Add a fixed remote source-cache release gate covering same-digest reuse,
+  changed-digest refresh, corrupt-cache recovery, cache-affine Direct Push,
+  SHA-256-verified ZIP recovery, and an explicit Direct Runner cache-health
+  heartbeat after push completion.
+- [ ] Benchmark external repository network, wall-clock, disk, and queueing
+  impact across operator-supplied hosts. The fixed release gate records
+  deterministic local-fixture cache-fill metrics, not public-network claims.
 
 ## After Cache: Oracle, Trajectory, And Reward
 

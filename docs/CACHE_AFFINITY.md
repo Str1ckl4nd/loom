@@ -104,8 +104,9 @@ tie-breaker.
 ## Inspection And Results
 
 Runner heartbeats advertise cache keys, entry count, byte count, and configured
-budget. Use the authenticated Hub APIs or matching CLI commands to inspect
-them:
+budget. Pull Runners report them during their loop; a Direct Runner sends a
+completion heartbeat after every pushed execution, whether it succeeds or
+fails. Use the authenticated Hub APIs or matching CLI commands to inspect them:
 
 ```bash
 python3 tools/loom_hub.py worker-cache --controller http://CONTROL_HOST:8765
@@ -119,6 +120,48 @@ added on a miss, materialization time, fallback, and eviction facts. Hub task
 admission, claim events, and Direct Push responses report the selected cache
 affinity. These records contain keys and canonical source identity, not cache
 contents or source credentials.
+
+## Remote Release Gate
+
+Run `tools/loom_source_cache_remote_smoke.py` on a fresh remote host whenever a
+change touches immutable source delivery, Runner cache behavior, worker cache
+health, or cache-affine scheduling. It creates a temporary two-commit Git
+repository on that host and starts two loopback-only Direct Runners:
+
+- the warm Runner fills the first immutable source key;
+- an automatic Direct Push must select that warm Runner for the same key;
+- a changed commit must receive a different key and refill; and
+- a deliberately damaged mirror must be repaired without reusing a workspace.
+
+All four result ZIPs are downloaded and SHA-256 checked. The gate writes source
+transfer bytes, materialization time, cache disk bytes, dispatch-to-clean time,
+and queue delay for each step. Source transfer bytes are a deterministic measure
+of cache-fill work in this local-file fixture; they are not a claim about
+public-internet bandwidth. By default it also runs the repository unit suite
+before starting the fixture and records that status in its redacted export.
+
+On the remote host only, choose a new empty runtime directory and run:
+
+```bash
+export LOOM_HUB_TOKEN="$(openssl rand -hex 32)"
+export LOOM_RUNNER_TOKEN="$(openssl rand -hex 32)"
+RUNTIME="$(mktemp -d /tmp/loom-source-cache-release.XXXXXX)"
+
+python3 tools/loom_source_cache_remote_smoke.py \
+  --repo-root "$PWD" \
+  --runtime-dir "$RUNTIME" \
+  --export-dir "$RUNTIME/recovered"
+```
+
+The optional redacted `cache-release-acceptance.json` excludes hostnames,
+worker IDs, result IDs, runtime paths, and raw output. The helper stops only its
+Hub and Runner processes. Copy the redacted report if needed, remove the runtime
+directory, then explicitly stop/delete the temporary host and confirm that it is
+no longer billable.
+
+The checked-in redacted evidence from this gate is in
+[`examples/source-cache/recovered/`](../examples/source-cache/recovered/). It
+proves the control-plane contract, not public-network throughput.
 
 ## Boundaries
 

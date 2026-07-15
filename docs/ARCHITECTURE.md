@@ -53,7 +53,7 @@ Runner -> start / renew / upload / complete or fail
 operator -> Hub push-task(task_id, worker_id)
 Hub      -> eligibility + capacity check + atomic lease
 Hub      -> Direct Runner /api/tasks/execute (leased task only)
-Runner   -> Hub start / renew / upload / complete or fail
+Runner   -> Hub start / renew / upload / complete or fail / completion heartbeat
 ```
 
 The Direct Runner validates that the task is assigned to its own worker ID and

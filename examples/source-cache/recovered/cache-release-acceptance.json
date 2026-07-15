@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "fixture": "loom-source-cache-release",
+  "contract": {
+    "fixture": "immutable Git source cache",
+    "task_count": 4,
+    "attempts_per_task": 1,
+    "workers": {
+      "warm": 1,
+      "cold": 1
+    },
+    "source_revisions": 2
+  },
+  "unit_tests": {
+    "ran": true,
+    "status": "passed"
+  },
+  "checks": {
+    "four_clean_result_packages": true,
+    "result_packages_hash_verified": true,
+    "result_packages_complete": true,
+    "result_package_cache_facts_consistent": true,
+    "initial_miss_transfers_source": true,
+    "same_digest_reuses_warm_cache": true,
+    "automatic_push_prefers_warm_runner": true,
+    "changed_digest_refreshes_cache": true,
+    "corrupt_cache_is_repaired": true,
+    "warm_cache_retains_two_digests": true
+  },
+  "steps": {
+    "initial_miss": {
+      "cache": {
+        "hit": false,
+        "state": "miss",
+        "repaired": false,
+        "transferred_bytes": 27201,
+        "materialization_seconds": 0.0389
+      },
+      "metrics": {
+        "dispatch_to_clean_seconds": 0.4234,
+        "queue_seconds": 0.0246
+      },
+      "package": {
+        "sha256_matches_controller": true,
+        "required_files_present": true,
+        "artifact_present": true,
+        "source_summary_cache_matches_worker_result": true
+      }
+    },
+    "same_digest_reuse": {
+      "cache": {
+        "hit": true,
+        "state": "hit",
+        "repaired": false,
+        "transferred_bytes": 0,
+        "materialization_seconds": 0.0091
+      },
+      "metrics": {
+        "dispatch_to_clean_seconds": 0.4223,
+        "queue_seconds": 0.0241
+      },
+      "package": {
+        "sha256_matches_controller": true,
+        "required_files_present": true,
+        "artifact_present": true,
+        "source_summary_cache_matches_worker_result": true
+      }
+    },
+    "changed_digest_refresh": {
+      "cache": {
+        "hit": false,
+        "state": "miss",
+        "repaired": false,
+        "transferred_bytes": 27201,
+        "materialization_seconds": 0.038
+      },
+      "metrics": {
+        "dispatch_to_clean_seconds": 0.4211,
+        "queue_seconds": 0.0207
+      },
+      "package": {
+        "sha256_matches_controller": true,
+        "required_files_present": true,
+        "artifact_present": true,
+        "source_summary_cache_matches_worker_result": true
+      }
+    },
+    "corrupt_cache_repair": {
+      "cache": {
+        "hit": false,
+        "state": "repaired",
+        "repaired": true,
+        "transferred_bytes": 27201,
+        "materialization_seconds": 0.0396
+      },
+      "metrics": {
+        "dispatch_to_clean_seconds": 0.4241,
+        "queue_seconds": 0.0262
+      },
+      "package": {
+        "sha256_matches_controller": true,
+        "required_files_present": true,
+        "artifact_present": true,
+        "source_summary_cache_matches_worker_result": true
+      }
+    }
+  },
+  "redaction": {
+    "omitted": [
+      "hostnames",
+      "worker identifiers",
+      "result IDs and URLs",
+      "runtime paths",
+      "raw command output"
+    ]
+  }
+}

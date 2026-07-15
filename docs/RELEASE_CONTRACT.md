@@ -69,6 +69,10 @@ never bypasses capability, retry, resource, placement, or concurrency checks.
 `push-task` may omit `worker_id` to choose an eligible Direct Runner with the
 same preference; a supplied worker ID remains exact.
 
+After every Direct Push execution, the Runner sends a completion heartbeat even
+when the task failed. That refreshes worker cache health and active-work facts
+without changing the Hub-owned task outcome.
+
 Worker `resource_capacity` and task `execution_profile` are part of the same
 lease admission decision. Hub atomically reserves declared CPU, memory, disk,
 and accelerator values for `leased` and `running` tasks. `shared` placement may
@@ -130,6 +134,15 @@ Run it only on an already-provisioned remote host with the fixture's declared
 upstream execution environment and the two Loom bearer tokens available in that
 host's environment. The exact command and cleanup sequence are in
 [Remote Validation](REMOTE_VALIDATION.md#fixed-agentdojo-release-smoke).
+
+Changes to immutable Git sources, Runner cache behavior, worker cache health, or
+cache-affine selection must additionally pass the
+[source-cache remote gate](CACHE_AFFINITY.md#remote-release-gate). It is a
+four-task, two-Runner check for first fill, same-digest reuse, changed-digest
+refresh, corrupt-cache repair, automatic cache-affine Direct Push, and
+hash-verified result recovery. It requires no model provider and must run on a
+fresh remote host; its source-transfer metric records cache-fill work rather
+than public-internet bandwidth.
 
 ## Non-Goals
 

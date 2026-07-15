@@ -54,6 +54,44 @@ provider run is an operator choice: override `--model` and pass each required
 provider environment variable through `--require-env NAME`. Neither choice
 changes Loom's Core Preview contract.
 
+## Immutable Source Cache Release Gate
+
+When a change affects immutable source delivery, the Runner cache, cache health,
+or cache-affine scheduling, run the dedicated source-cache gate on a separate
+fresh remote host. It has no model dependency and does not contact a public
+source repository: the helper creates an ephemeral two-commit Git fixture on the
+remote host, starts a warm and a cold Direct Runner, and checks four normal
+result packages.
+
+```bash
+export LOOM_HUB_TOKEN="$(openssl rand -hex 32)"
+export LOOM_RUNNER_TOKEN="$(openssl rand -hex 32)"
+RUNTIME="$(mktemp -d /tmp/loom-source-cache-release.XXXXXX)"
+
+python3 tools/loom_source_cache_remote_smoke.py \
+  --repo-root "$PWD" \
+  --runtime-dir "$RUNTIME" \
+  --export-dir "$RUNTIME/recovered"
+```
+
+The gate requires an initial miss with source transfer, a same-digest hit with
+zero source transfer, automatic Direct Push to the warm Runner, a changed digest
+with a new cache key, and repair after a deliberately corrupted mirror. It
+hash-verifies every result ZIP and records source-transfer bytes,
+materialization time, cache disk bytes, dispatch-to-clean time, and queue delay.
+Its transfer metric is a deterministic cache-fill proxy, not an external network
+benchmark. The default invocation first runs the repository unit suite and
+records its pass status in the redacted acceptance export.
+
+`RUNTIME` must be empty when the command starts. After retaining only the
+redacted acceptance report, remove it and explicitly stop/delete the temporary
+instance. Confirm there are no billable resources remaining before considering
+the remote validation complete.
+
+The repository keeps only the redacted acceptance report in
+[`examples/source-cache/recovered/`](../examples/source-cache/recovered/); raw
+ZIPs, temporary paths, and host identity remain outside Git.
+
 ## Support Boundary
 
 This project supports validation on existing, operator-supplied hosts. The

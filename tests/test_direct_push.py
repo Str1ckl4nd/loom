@@ -212,6 +212,80 @@ class DirectPushTests(unittest.TestCase):
         self.assertEqual(task_payload["extensions"], expected_extensions)
         self.assertEqual(worker_result["task_extensions"], expected_extensions)
 
+    def test_direct_push_refreshes_cache_health_after_source_fill(self) -> None:
+        source_repo = self.root / "direct-cache-health-source"
+        source_repo.mkdir()
+        for command in (
+            ["git", "init"],
+            ["git", "config", "user.name", "Loom test"],
+            ["git", "config", "user.email", "loom@example.test"],
+        ):
+            subprocess.run(command, cwd=source_repo, check=True, text=True, capture_output=True)
+        (source_repo / "input.txt").write_text("cache-health\n", encoding="utf-8")
+        subprocess.run(["git", "add", "input.txt"], cwd=source_repo, check=True, text=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "fixture"], cwd=source_repo, check=True, text=True, capture_output=True)
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=source_repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        source = {"type": "git", "url": str(source_repo), "commit": commit}
+        descriptor = git_source_descriptor(source)
+        self.assertIsNotNone(descriptor)
+
+        task_id = "direct-cache-health__case-a__setting-a__run-001"
+        request_json(
+            self.controller + "/api/tasks/dispatch",
+            {
+                "schema_version": 1,
+                "operator": "test",
+                "tasks": [
+                    {
+                        "task_id": task_id,
+                        "required_capability": "linux",
+                        "payload": {
+                            "runner": "repo",
+                            "source": source,
+                            "commands": [
+                                {
+                                    "name": "verify-source",
+                                    "command": [
+                                        "python3",
+                                        "-c",
+                                        "from pathlib import Path; assert Path('input.txt').read_text() == 'cache-health\\n'",
+                                    ],
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            token=self.hub_token,
+        )
+        pushed = request_json(
+            self.controller + "/api/admin/push-task",
+            {"task_id": task_id, "worker_id": self.runner_args.worker_id, "operator": "test"},
+            token=self.hub_token,
+        )
+        self.assertTrue(pushed["ok"])
+
+        rows: list[dict[str, object]] = []
+        cache: dict[str, object] = {}
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            rows = request_json(self.controller + "/api/tasks?task_id=" + task_id, token=self.hub_token)["tasks"]
+            worker_rows = request_json(self.controller + "/api/data/worker-cache", token=self.hub_token)["workers"]
+            worker = next((row for row in worker_rows if row["worker_id"] == self.runner_args.worker_id), {})
+            cache = dict(worker.get("source_cache") or {})
+            if rows and rows[0]["state"] == "clean" and descriptor["cache_key"] in set(cache.get("keys") or []):
+                break
+            time.sleep(0.2)
+        self.assertEqual(rows[0]["state"], "clean")
+        self.assertTrue(cache["enabled"])
+        self.assertIn(descriptor["cache_key"], cache["keys"])
+
+        runner_health = request_json(self.runner_url + "/api/healthz", token=self.runner_token)
+        self.assertTrue(runner_health["last_result"]["heartbeat"]["ok"])
+        self.assertEqual(runner_health["last_result"]["heartbeat"]["phase"], "completed")
+
     def test_dispatch_rejects_non_object_extensions(self) -> None:
         with self.assertRaises(HTTPError) as invalid:
             request_json(

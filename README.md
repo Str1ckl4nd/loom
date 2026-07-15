@@ -212,6 +212,7 @@ delivery protocol.
 | [Loom Manifest](docs/TASK_MANIFEST.md) | When preparing a campaign, retry policy, private source, or expected-result contract. |
 | [Resource Admission](docs/RESOURCE_ADMISSION.md) | When sharing existing workers safely with declared task resource requests. |
 | [Source Cache And Cache Affinity](docs/CACHE_AFFINITY.md) | When reusing pinned Git sources or inspecting cache-local scheduling. |
+| [Source-Cache Gate Evidence](examples/source-cache/recovered/) | When inspecting the redacted remote cache-affinity release receipt. |
 | [Release Contract](docs/RELEASE_CONTRACT.md) | When changing phases, Direct Runner delivery, authentication, result retention, or release gates. |
 | [AgentDojo Release Fixture](docs/AGENTDOJO_EXAMPLE.md) | When running or inspecting the fixed 2-case x 2-run x 2-attempt remote regression. |
 | [Architecture](docs/ARCHITECTURE.md) | When integrating the Hub, Runner, connection modes, concurrency behavior, or result APIs. |

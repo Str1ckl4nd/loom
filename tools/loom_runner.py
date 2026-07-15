@@ -1673,15 +1673,34 @@ class DirectWorkerHandler(BaseHTTPRequestHandler):
             self.server.push_futures[task_id] = future
             self.server.last_result = {"ok": True, "state": "accepted", "task_id": task_id, "accepted_at": utc_now()}
 
-            def complete(done: Future[dict[str, Any]]) -> None:
-                try:
-                    result = done.result()
-                except Exception as exc:
-                    result = {"task_id": task_id, "ok": False, "error": {"type": type(exc).__name__, "detail": str(exc)}}
-                with self.server.state_lock:
-                    self.server.last_result = {**result, "finished_at": utc_now()}
+        def complete(done: Future[dict[str, Any]]) -> None:
+            try:
+                result = done.result()
+            except Exception as exc:
+                result = {"task_id": task_id, "ok": False, "error": {"type": type(exc).__name__, "detail": str(exc)}}
+            with self.server.state_lock:
+                active_pushes = self._active_pushes()
+            current_runs = [{"task_id": active_task_id, "phase": "running"} for active_task_id in active_pushes]
+            heartbeat_state = "running" if current_runs else "completed"
+            heartbeat_result: dict[str, Any] = {"ok": True, "phase": heartbeat_state, "active_task_ids": active_pushes}
+            try:
+                heartbeat(self.server.worker_args, current_runs, heartbeat_state)
+            except Exception as exc:
+                # A result has already been uploaded. Keep the task outcome and
+                # expose a stale-health condition instead of reporting a false
+                # Direct Push failure to the controller.
+                heartbeat_result = {
+                    "ok": False,
+                    "phase": heartbeat_state,
+                    "active_task_ids": active_pushes,
+                    "error": {"type": type(exc).__name__, "detail": str(exc)},
+                }
+            with self.server.state_lock:
+                self.server.last_result = {**result, "finished_at": utc_now(), "heartbeat": heartbeat_result}
 
-            future.add_done_callback(complete)
+        # Attach after releasing state_lock: a fast task may already be done,
+        # and Future then invokes callbacks synchronously.
+        future.add_done_callback(complete)
         self._json(202, {"ok": True, "state": "accepted", "task_id": task_id, "worker_id": worker_id})
 
     def log_message(self, fmt: str, *args: Any) -> None:
