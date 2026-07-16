@@ -6,6 +6,36 @@
   independently versioned inventory, manifest, dispatch, and API contracts at
   `v1`.
 
+## Next: Task-Graph Splitting And Stage Scheduling
+
+- [ ] Promote runner-local `phases` into an opt-in, versioned task-graph
+  contract. A campaign must be able to expand one case/run into deterministic
+  independently schedulable stage tasks with explicit dependencies, while
+  legacy ordered `phases` remain one execution attempt for compatibility.
+- [ ] Give every stage its own controller-owned identity, lease, attempt
+  history, resource profile, capability requirement, priority, timeout, and
+  retry policy. A failed `evaluate` stage must not rerun a completed expensive
+  `prepare` stage, and cancelling or retrying one stage must not mutate its
+  siblings.
+- [ ] Define a content-addressed stage handoff contract: downstream stages
+  request named upstream artifacts by declared SHA-256 and materialize only
+  those validated inputs. Do not pass an opaque writable workspace between
+  workers or silently infer dependencies from paths.
+- [ ] Make stage-specific command arguments, environment, working directory,
+  artifacts, and Loom runtime metadata explicit in the manifest. Preserve the
+  existing case/run/attempt injection and add immutable stage and dependency
+  identifiers so one main script can distinguish preparation, evaluation, and
+  collection safely.
+- [ ] Schedule only dependency-ready stages through the existing fairness,
+  priority, capability, resource-admission, concurrency, and cache-affinity
+  rules. A cache hit remains a preference; dependency readiness and hard
+  capacity limits remain requirements.
+- [ ] Add remote-only release coverage for a multi-worker stage graph:
+  independent case/run selection, upstream artifact handoff and hash failure,
+  stage-only retry/cancel, blocked-dependency recovery, and result ZIP
+  retention. Keep the fixed AgentDojo 2-case x 2-run x 2-attempt fixture as
+  the execution-level regression, not evidence that stage splitting works.
+
 ## Release Contract And AgentDojo Example
 
 - [x] Add a versioned `phases` manifest contract that preserves the current
