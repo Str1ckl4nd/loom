@@ -31,10 +31,12 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from loom_cache import cache_key_digest, canonical_git_url, git_checkout_ref, git_source_descriptor, source_cache_key
 from loom_contract import CONCURRENCY_POLICIES, CORE_PREVIEW_VERSION, RUNNER_API_VERSION, metadata, normalize_extensions
+from loom_evaluation import export_trajectory, normalize_trajectory_export, trajectory_required_failure
 from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, bearer_headers, is_loopback_host, token_from_env, token_matches
 from loom_resources import normalize_capacity, normalize_capacity_overrides
 
@@ -155,6 +157,57 @@ def upload_file(
         return json.loads(resp.read().decode("utf-8-sig"))
 
 
+def download_execution_result(
+    base: str,
+    reference: dict[str, Any],
+    destination: Path,
+    *,
+    token: str | None = None,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Fetch an Oracle input ZIP and verify the Hub-recorded bytes and SHA-256."""
+    result_id = str(reference.get("result_id") or "").strip()
+    if not result_id or not bool(reference.get("available", True)):
+        raise ValueError("Oracle task has no available execution result reference")
+    expected_bytes = int(reference.get("bytes") or 0)
+    expected_sha256 = str(reference.get("sha256") or "").strip().lower()
+    if expected_bytes <= 0 or not expected_sha256:
+        raise ValueError("Oracle execution result reference is missing bytes or sha256")
+    request = Request(
+        base.rstrip("/") + "/api/results/" + quote(result_id, safe=""),
+        headers={"Accept": "application/zip", **bearer_headers(token)},
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    downloaded = 0
+    try:
+        with urlopen(request, timeout=timeout) as response, destination.open("wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                digest.update(chunk)
+                downloaded += len(chunk)
+        actual_sha256 = digest.hexdigest()
+        if downloaded != expected_bytes or actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"execution result integrity mismatch: bytes={downloaded}/{expected_bytes} "
+                f"sha256={actual_sha256}/{expected_sha256}"
+            )
+        return {
+            "result_id": result_id,
+            "task_id": reference.get("task_id"),
+            "attempt_no": int(reference.get("attempt_no") or 1),
+            "bytes": downloaded,
+            "sha256": actual_sha256,
+            "path": destination.name,
+        }
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
 def shell_command(payload: dict[str, Any]) -> list[str] | str:
     command = payload.get("command")
     if command:
@@ -203,6 +256,68 @@ def build_env(payload: dict[str, Any], command_spec: dict[str, Any] | None = Non
         if command_spec.get("phase_index") is not None:
             env["LOOM_PHASE_INDEX"] = str(command_spec["phase_index"])
     return env
+
+
+def runtime_env(payload: dict[str, Any]) -> dict[str, str]:
+    current = payload.get("_loom_runtime_env")
+    if not isinstance(current, dict):
+        current = {}
+        payload["_loom_runtime_env"] = current
+    return current
+
+
+def trajectory_export_config(payload: dict[str, Any]) -> dict[str, Any] | None:
+    raw = payload.get("trajectory_export")
+    return normalize_trajectory_export(raw) if raw is not None else None
+
+
+def configure_trajectory_runtime(
+    payload: dict[str, Any],
+    config: dict[str, Any] | None,
+    *,
+    source_root: Path,
+) -> None:
+    if config is None or not bool(config.get("enabled", True)):
+        return
+    path = source_root / str(config["source_path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_env(payload)["LOOM_TRAJECTORY_PATH"] = str(path)
+
+
+def prepare_oracle_input(
+    task: dict[str, Any],
+    payload: dict[str, Any],
+    task_dir: Path,
+    *,
+    controller: str | None,
+    controller_token: str | None,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    if str(task.get("task_kind") or "execution") != "oracle":
+        return None, None
+    if not controller:
+        raise ValueError("Oracle task requires a controller URL to download its execution result")
+    contract = payload.get("oracle_contract") if isinstance(payload.get("oracle_contract"), dict) else {}
+    result_path = Path(str(contract.get("result_path") or "oracle-result.json"))
+    if result_path.is_absolute() or ".." in result_path.parts:
+        raise ValueError("Oracle result_path must stay inside the attempt directory")
+    destination = task_dir / "execution-result.zip"
+    reference = task.get("execution_result")
+    if not isinstance(reference, dict):
+        raise ValueError("Oracle task is missing its execution result reference")
+    receipt = download_execution_result(controller, reference, destination, token=controller_token)
+    env = runtime_env(payload)
+    env.update(
+        {
+            "LOOM_EXECUTION_RESULT_ID": str(receipt["result_id"]),
+            "LOOM_EXECUTION_TASK_ID": str(receipt.get("task_id") or ""),
+            "LOOM_EXECUTION_ATTEMPT_NO": str(receipt["attempt_no"]),
+            "LOOM_EXECUTION_RESULT_ZIP": str(destination),
+            "LOOM_ORACLE_RESULT_PATH": str(task_dir / result_path),
+            "LOOM_ORACLE_VERSION": str(contract.get("oracle_version") or ""),
+            "LOOM_ORACLE_NAME": str(contract.get("name") or ""),
+        }
+    )
+    return destination, receipt
 
 
 def command_with_args(spec: dict[str, Any]) -> list[str] | str:
@@ -1014,7 +1129,10 @@ def run_repo_task(
     exit_code = 0 if materialized.get("ok") else 2
     commands = command_list(payload)
     artifacts: list[dict[str, Any]] = []
+    trajectory_config = trajectory_export_config(payload)
+    trajectory: dict[str, Any] | None = None
     try:
+        configure_trajectory_runtime(payload, trajectory_config, source_root=workspace_dir)
         if exit_code == 0:
             for idx, spec in enumerate(commands, start=1):
                 command = command_with_args(spec)
@@ -1051,6 +1169,12 @@ def run_repo_task(
         artifact_patterns = [str(p) for p in payload.get("artifact_paths") or payload.get("artifacts") or []]
         for spec in commands:
             artifact_patterns.extend(str(pattern) for pattern in spec.get("artifact_paths") or [])
+        if trajectory_config is not None:
+            trajectory = export_trajectory(trajectory_config, source_root=workspace_dir, export_root=task_dir)
+            write_json(task_dir / "trajectory-summary.json", trajectory)
+            if trajectory_required_failure(trajectory) and exit_code == 0:
+                exit_code = 2
+        # Exporting removes the raw input before any artifact glob can copy it.
         artifacts = collect_artifacts(workspace_dir, task_dir, artifact_patterns) if workspace_dir.exists() else []
     finally:
         cleanup_cached_workspace(materialized, task_dir)
@@ -1060,12 +1184,19 @@ def run_repo_task(
         "commands": command_results,
         "phases": command_results,
         "artifacts": artifacts,
+        "trajectory": trajectory,
         "exit_code": exit_code,
         "verdict": "clean" if exit_code == 0 else "run_error",
     }
 
 
-def zip_task_dir(task_dir: Path, zip_path: Path) -> None:
+def zip_task_dir(
+    task_dir: Path,
+    zip_path: Path,
+    *,
+    excluded_relative_paths: set[str] | None = None,
+) -> None:
+    excluded = {"execution-result.zip", *(excluded_relative_paths or set())}
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for root, dirs, files in os.walk(task_dir):
             root_path = Path(root)
@@ -1074,6 +1205,8 @@ def zip_task_dir(task_dir: Path, zip_path: Path) -> None:
             for name in files:
                 item = root_path / name
                 rel = item.relative_to(task_dir)
+                if rel.as_posix() in excluded:
+                    continue
                 z.write(item, rel.as_posix())
 
 
@@ -1083,6 +1216,8 @@ def run_task(
     *,
     source_cache_dir: Path | None = None,
     source_cache_max_bytes: int = 0,
+    controller: str | None = None,
+    controller_token: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     task_id = task["task_id"]
     payload = dict(task.get("payload") or {})
@@ -1095,6 +1230,7 @@ def run_task(
         "LOOM_CASE_ID": str(task.get("case_id") or normalized.get("case_id") or ""),
         "LOOM_RUN_ID": str(task.get("run_id") or normalized.get("run_id") or ""),
         "LOOM_SETTING_ID": str(task.get("setting_id") or normalized.get("setting_id") or ""),
+        "LOOM_TASK_KIND": str(task.get("task_kind") or "execution"),
     }
     attempt_no = max(1, int(task.get("attempt_no") or 1))
     task_root = work_root / task_id
@@ -1113,16 +1249,34 @@ def run_task(
     exit_code = 0
     measurement_records: list[dict[str, Any]] = []
     repo_result: dict[str, Any] | None = None
+    trajectory: dict[str, Any] | None = None
+    trajectory_config: dict[str, Any] | None = None
+    execution_input_path: Path | None = None
+    execution_input: dict[str, Any] | None = None
     try:
+        trajectory_config = trajectory_export_config(payload)
+        execution_input_path, execution_input = prepare_oracle_input(
+            task,
+            payload,
+            task_dir,
+            controller=controller,
+            controller_token=controller_token,
+        )
         if runner == "shell":
-            command = shell_command(payload)
-            proc = run_process(command, cwd=task_dir, timeout=timeout, env=build_env(payload))
-            stdout = proc.stdout
-            stderr = proc.stderr
-            exit_code = int(proc.returncode)
-            usage = getattr(proc, "resource_usage", None)
-            if isinstance(usage, dict):
-                measurement_records.append({"resource_usage": usage})
+            configure_trajectory_runtime(payload, trajectory_config, source_root=task_dir)
+            try:
+                command = shell_command(payload)
+                proc = run_process(command, cwd=task_dir, timeout=timeout, env=build_env(payload))
+                stdout = proc.stdout
+                stderr = proc.stderr
+                exit_code = int(proc.returncode)
+                usage = getattr(proc, "resource_usage", None)
+                if isinstance(usage, dict):
+                    measurement_records.append({"resource_usage": usage})
+            finally:
+                if trajectory_config is not None:
+                    trajectory = export_trajectory(trajectory_config, source_root=task_dir, export_root=task_dir)
+                    write_json(task_dir / "trajectory-summary.json", trajectory)
         elif runner == "repo":
             repo_result = run_repo_task(
                 payload,
@@ -1135,8 +1289,13 @@ def run_task(
             exit_code = int(repo_result["exit_code"])
             measurement_records.extend(repo_result.get("commands") or [])
             measurement_records.extend((repo_result.get("materialized") or {}).get("steps") or [])
+            trajectory = repo_result.get("trajectory") if isinstance(repo_result.get("trajectory"), dict) else None
         elif runner == "noop":
             stdout = "noop ok\n"
+            configure_trajectory_runtime(payload, trajectory_config, source_root=task_dir)
+            if trajectory_config is not None:
+                trajectory = export_trajectory(trajectory_config, source_root=task_dir, export_root=task_dir)
+                write_json(task_dir / "trajectory-summary.json", trajectory)
         else:
             exit_code = 2
             stderr = f"unsupported runner: {runner}\n"
@@ -1147,6 +1306,15 @@ def run_task(
     except Exception as exc:
         exit_code = 2
         stderr = f"{type(exc).__name__}: {exc}\n"
+    finally:
+        if execution_input_path is not None:
+            try:
+                execution_input_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if trajectory is not None and trajectory_required_failure(trajectory) and exit_code == 0:
+        exit_code = 2
+        stderr = (stderr + "\n" if stderr else "") + f"trajectory export failed: {trajectory.get('status')}\n"
     duration_seconds = time.monotonic() - started_monotonic
     measured_usage = aggregate_resource_usage(measurement_records, duration_seconds)
 
@@ -1154,6 +1322,7 @@ def run_task(
     (task_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
     result = {
         "task_id": task_id,
+        "task_kind": str(task.get("task_kind") or "execution"),
         "worker_observed_at": utc_now(),
         "started_at": started,
         "completed_at": utc_now(),
@@ -1173,13 +1342,20 @@ def run_task(
         result["repo_result_path"] = "stdout.txt"
         result["phase_result_path"] = "phase-results.json"
         result["source_cache"] = (repo_result or {}).get("materialized", {}).get("source_cache", {})
+    if execution_input is not None:
+        result["execution_input"] = execution_input
+    if trajectory is not None:
+        result["trajectory"] = trajectory
     if normalized:
         result["normalized"] = normalized
     if "extensions" in payload:
         result["task_extensions"] = normalize_extensions(payload["extensions"], field="payload.extensions")
     write_json(task_dir / "worker-result.json", result)
     zip_path = task_root / f"attempt-{attempt_no:03d}.zip"
-    zip_task_dir(task_dir, zip_path)
+    trajectory_raw_paths: set[str] = set()
+    if trajectory_config is not None and bool(trajectory_config.get("enabled", True)):
+        trajectory_raw_paths.add(str(trajectory_config["source_path"]))
+    zip_task_dir(task_dir, zip_path, excluded_relative_paths=trajectory_raw_paths)
     return zip_path, result
 
 
@@ -1332,6 +1508,8 @@ def handle_one(args: argparse.Namespace, work_root: Path) -> bool:
             work_root,
             source_cache_dir=source_cache_dir,
             source_cache_max_bytes=source_cache_max_bytes,
+            controller=args.controller,
+            controller_token=controller_token(args),
         )
         current[0]["phase"] = "uploading"
         heartbeat(args, current, "uploading")
@@ -1402,6 +1580,8 @@ def execute_claimed_task(args: argparse.Namespace, work_root: Path, task: dict[s
             work_root,
             source_cache_dir=source_cache_dir,
             source_cache_max_bytes=source_cache_max_bytes,
+            controller=args.controller,
+            controller_token=controller_token(args),
         )
         upload = upload_file(args.controller, task_id, args.worker_id, zip_path, token=controller_token(args))
         if not (upload.get("auto_retry") or {}).get("queued"):

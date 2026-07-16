@@ -61,23 +61,23 @@
 
 ## After Cache: Oracle, Trajectory, And Reward
 
-- [ ] Add a separately schedulable `oracle` contract. Hub should queue it from
+- [x] Add a separately schedulable `oracle` contract. Hub should queue it from
   an execution result reference, with its own capability, resource profile,
   timeout, retry policy, and attempt history.
-- [ ] Keep execution and Oracle outcomes independent: execution success/error/
+- [x] Keep execution and Oracle outcomes independent: execution success/error/
   timeout must not be confused with Oracle `pass`, `fail`, `error`, or
   `inconclusive`. Oracle retries must not rerun a successful expensive Agent
   attempt.
-- [ ] Add explicit recovery/export selectors such as `all_attempts`,
+- [x] Add explicit recovery/export selectors such as `all_attempts`,
   `execution_clean`, `oracle_decided`, and `oracle_pass`. Retain raw attempt
   ZIPs by default; selectors control export, never silent evidence deletion.
-- [ ] Define an opt-in, versioned trajectory export contract for agent messages,
+- [x] Define an opt-in, versioned trajectory export contract for agent messages,
   tool calls, observations, timings, and artifact references. Include redaction
   and size policies; raw trajectory capture must remain disabled by default.
-- [ ] Define a versioned reward contract owned by Oracle output, supporting a
+- [x] Define a versioned reward contract owned by Oracle output, supporting a
   scalar reward, optional named components, score metadata, Oracle version, and
   evidence references. Loom exports this data but does not become an RL trainer.
-- [ ] Add remote release coverage for Oracle pass/fail/error/inconclusive,
+- [x] Add remote release coverage for Oracle pass/fail/error/inconclusive,
   trajectory redaction, reward integrity, and export selection across retries.
 
 ## Resource Multiplexing And Local Mode

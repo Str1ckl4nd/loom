@@ -92,6 +92,37 @@ The repository keeps only the redacted acceptance report in
 [`examples/source-cache/recovered/`](../examples/source-cache/recovered/); raw
 ZIPs, temporary paths, and host identity remain outside Git.
 
+## Oracle, Trajectory, And Reward Release Gate
+
+Changes to Oracle dispatch, verified parent-result transfer, trajectory export,
+reward output, or semantic result selection require this lightweight gate on one
+fresh remote host. It has no model-provider or benchmark dependency: the remote
+test starts authenticated loopback-only Hub and Direct Runner processes, then
+proves the public contract around one execution ZIP and independently scheduled
+Oracle attempts.
+
+```bash
+RUNTIME="$(mktemp -d /tmp/loom-oracle-contract-release.XXXXXX)"
+
+python3 tools/loom_oracle_remote_smoke.py \
+  --repo-root "$PWD" \
+  --runtime-dir "$RUNTIME" \
+  --export-dir "$RUNTIME/recovered"
+```
+
+The targeted check covers semantic `pass`, `fail`, `error`, and `inconclusive`,
+an `oracle_error` child retry that does not rerun its parent, token-authenticated
+result transfer, trajectory redaction and raw-file exclusion, reward fields, and
+all four recovery selectors. By default the helper also runs the complete unit
+suite on that remote host. It emits a small redacted
+`oracle-release-acceptance.json`; raw ZIPs, trajectory content, command strings,
+logs, runtime paths, and host identity must not enter Git.
+
+Copy only the redacted acceptance export into
+[`examples/oracle/recovered/`](../examples/oracle/recovered/) after success.
+Remove `RUNTIME`, explicitly stop/delete the temporary instance, and confirm
+that no billing resources remain before treating the validation as complete.
+
 ## Support Boundary
 
 This project supports validation on existing, operator-supplied hosts. The

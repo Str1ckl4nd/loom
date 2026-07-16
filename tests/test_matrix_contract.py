@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +14,36 @@ import loom_matrix
 
 
 class MatrixContractTests(unittest.TestCase):
+    def test_remote_setup_bundle_includes_public_evaluation_contract(self) -> None:
+        self.assertIn("loom_evaluation.py", loom_matrix.REMOTE_TOOL_FILES)
+
+    def test_source_preflight_includes_a_repo_oracle_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            spec = Path(directory) / "dispatch.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "payload": {
+                                    "runner": "shell",
+                                    "oracle": {
+                                        "payload": {
+                                            "runner": "repo",
+                                            "source": {"url": "https://oracle.example.test/judge.git"},
+                                        }
+                                    },
+                                }
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            requirements = loom_matrix.source_requirements([spec])
+
+        self.assertIn("source-oracle-example-test", requirements)
+
     def test_runner_start_preserves_inventory_concurrency_contract(self) -> None:
         commands: list[str] = []
         original_ssh = loom_matrix.ssh

@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "campaign_id": "oracle-trajectory-reward-example",
+  "defaults": {
+    "runner": "shell",
+    "required_capability": "linux",
+    "timeout_seconds": 120,
+    "artifact_paths": ["execution-summary.json"],
+    "command": [
+      "python3",
+      "-c",
+      "import json, os; from pathlib import Path; Path(os.environ['LOOM_TRAJECTORY_PATH']).write_text(json.dumps({'schema_version': 1, 'events': [{'kind': 'message', 'content': 'example execution'}, {'kind': 'tool_call', 'name': 'lookup'}]}) + '\\n', encoding='utf-8'); Path('execution-summary.json').write_text('complete\\n', encoding='utf-8')"
+    ],
+    "trajectory_export": {
+      "schema_version": 1,
+      "source_path": ".loom-trajectory.raw.json",
+      "export_path": "trajectory.json",
+      "max_bytes": 4096,
+      "required": true,
+      "redaction": {
+        "patterns": [],
+        "replacement": "[REDACTED]"
+      }
+    },
+    "oracle": {
+      "schema_version": 1,
+      "name": "completion-check",
+      "when": "execution_clean",
+      "oracle_version": "completion-check-v1",
+      "required_capability": "oracle",
+      "retry_policy": {
+        "max_attempts": 2,
+        "retry_categories": ["oracle_error"]
+      },
+      "payload": {
+        "runner": "shell",
+        "timeout_seconds": 120,
+        "command": [
+          "python3",
+          "-c",
+          "import json, os, zipfile; from pathlib import Path; archive=zipfile.ZipFile(os.environ['LOOM_EXECUTION_RESULT_ZIP']); assert 'worker-result.json' in archive.namelist(); result={'schema_version': 1, 'outcome': 'pass', 'oracle_version': 'completion-check-v1', 'reward': {'value': 1.0, 'components': {'completed': 1.0}, 'metadata': {'scale': 'unit'}}, 'summary': {'reason': 'execution package is present'}}; Path(os.environ['LOOM_ORACLE_RESULT_PATH']).write_text(json.dumps(result) + '\\n', encoding='utf-8')"
+        ]
+      }
+    }
+  },
+  "cases": [
+    {
+      "case_id": "example-case",
+      "setting_id": "baseline",
+      "run_id": "001"
+    }
+  ]
+}

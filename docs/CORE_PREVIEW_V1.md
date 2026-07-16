@@ -1,16 +1,16 @@
-# Core Preview v0.3 Compatibility
+# Core Preview v0.4 Compatibility
 
-Loom Core Preview v0.3 freezes its public integration surface around versioned
+Loom Core Preview v0.4 freezes its public integration surface around versioned
 files, command-line entry points, and authenticated HTTP metadata. Downstream
 automation must use this surface. Importing a function from a file under
 `tools/` is not a supported integration and carries no compatibility promise.
 
-The product release is `v0.3.0`; the inventory, manifest, dispatch, Hub API,
+The product release is `v0.4.0`; the inventory, manifest, dispatch, Hub API,
 and Runner API contracts remain independently versioned at `v1`.
 
 ## Version Discovery
 
-The four public commands report their contract version without requiring a
+The five public commands report their contract version without requiring a
 running controller:
 
 ```bash
@@ -18,6 +18,7 @@ python3 tools/loom_manifest.py --version
 python3 tools/loom_matrix.py --version
 python3 tools/loom_hub.py --version
 python3 tools/loom_runner.py --version
+python3 tools/loom_export.py --version
 ```
 
 An authenticated Hub and Direct Runner expose their runtime capability document:
@@ -40,6 +41,13 @@ user-owned `extensions` metadata end to end. Manifest, Hub, and Runner also
 advertise immutable-source and cache capabilities when an immutable Git source
 can be reused locally; inspect `capabilities` rather than importing `tools/`
 functions.
+
+Hub additionally advertises `oracle-v1`, `trajectory-export-v1`,
+`reward-contract-v1`, and `result-export-selectors-v1`. Runner advertises
+`oracle-input-result-v1` and `trajectory-export-v1`. These additive capabilities
+define the supported execution-result handoff, semantic outcomes, opt-in
+trajectory export, reward data, and selector-based recovery surface. See
+[Oracle, Trajectory, And Reward](ORACLE_TRAJECTORY_REWARD.md).
 
 ## Frozen File Contracts
 

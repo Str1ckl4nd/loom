@@ -18,6 +18,7 @@ from typing import Any
 
 from loom_cache import attach_source_descriptor
 from loom_contract import CORE_PREVIEW_VERSION, MANIFEST_SCHEMA_VERSION, merge_extensions
+from loom_evaluation import normalize_oracle_spec, normalize_trajectory_export
 from loom_resources import normalize_execution_profile
 
 SAFE_ID = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -210,6 +211,35 @@ def execution_profile_spec(defaults: dict[str, Any], case: dict[str, Any], paylo
     return normalize_execution_profile(expand_template(raw, context))
 
 
+def optional_contract(
+    *,
+    campaign: dict[str, Any],
+    defaults: dict[str, Any],
+    case: dict[str, Any],
+    default_payload: dict[str, Any],
+    case_payload: dict[str, Any],
+    field: str,
+    context: dict[str, Any],
+    normalizer: Any,
+) -> dict[str, Any] | None:
+    """Resolve an atomic public contract with the same layer order as extensions."""
+    selected: Any = None
+    selected_field = field
+    for layer_field, value in (
+        (f"campaign.{field}", campaign.get(field)),
+        (f"defaults.{field}", defaults.get(field)),
+        (f"defaults.payload.{field}", default_payload.get(field)),
+        (f"case.{field}", case.get(field)),
+        (f"case.payload.{field}", case_payload.get(field)),
+    ):
+        if value is not None:
+            selected = value
+            selected_field = layer_field
+    if selected is None:
+        return None
+    return normalizer(expand_template(selected, context), field=selected_field)
+
+
 def normalize(
     data: Any,
     *,
@@ -279,6 +309,30 @@ def normalize(
         )
         if any(value is not None for _, value in extension_layers):
             payload["extensions"] = merge_extensions(*extension_layers)
+        oracle = optional_contract(
+            campaign=campaign,
+            defaults=defaults,
+            case=case,
+            default_payload=default_payload or {},
+            case_payload=case_payload or {},
+            field="oracle",
+            context=context,
+            normalizer=normalize_oracle_spec,
+        )
+        if oracle is not None:
+            payload["oracle"] = oracle
+        trajectory_export = optional_contract(
+            campaign=campaign,
+            defaults=defaults,
+            case=case,
+            default_payload=default_payload or {},
+            case_payload=case_payload or {},
+            field="trajectory_export",
+            context=context,
+            normalizer=normalize_trajectory_export,
+        )
+        if trajectory_export is not None:
+            payload["trajectory_export"] = trajectory_export
         runner = str(case.get("runner") or payload.get("runner") or defaults.get("runner") or "repo")
         artifact_paths = string_list(
             case.get("artifact_paths") or case.get("artifacts") or defaults.get("artifact_paths"),

@@ -1,9 +1,9 @@
 # Release Contract
 
-This document defines the stable Core Preview v0.3 release contract. A Loom release must
+This document defines the stable Core Preview v0.4 release contract. A Loom release must
 keep these boundaries intact even while the implementation evolves. The
 versioned public CLI, inventory, manifest, dispatch, token, and capability
-surface is listed in [Core Preview v0.3 Compatibility](CORE_PREVIEW_V1.md) and
+surface is listed in [Core Preview v0.4 Compatibility](CORE_PREVIEW_V1.md) and
 [Versioning](VERSIONING.md).
 
 ## V1 Task Contract
@@ -117,6 +117,26 @@ Result ZIPs exclude the source checkout. Retried attempts remain queryable by
 the same task ID and distinct `attempt_no`; a later clean attempt cannot erase a
 failure package.
 
+## Oracle, Trajectory, And Reward Contract
+
+An optional v1 Oracle is a child task over one retained execution ZIP, not a
+field that overwrites the execution task. Hub records the child process state and
+the Oracle's semantic `pass`, `fail`, `error`, or `inconclusive` outcome
+independently. An `oracle_error` retry affects only the child task and continues
+to reference the exact parent ZIP by result ID, byte length, and SHA-256.
+
+Trajectory capture is disabled unless the execution payload explicitly declares
+`trajectory_export`. When enabled, Runner enforces the configured size bound,
+redacts the structured document, records its SHA-256 receipt, and removes the
+raw trace before artifact collection and ZIP creation. Oracle-owned rewards are
+versioned structured output, not a Hub scheduling or training signal.
+
+The public recovery selectors `all_attempts`, `execution_clean`,
+`oracle_decided`, and `oracle_pass` select retained ZIPs but never delete them.
+Each semantic selector includes both the Oracle package and the referenced
+execution package. The [Oracle, Trajectory, And Reward Contract](ORACLE_TRAJECTORY_REWARD.md)
+defines the exact fields, API queries, and information boundary.
+
 ## Required Remote Release Check
 
 The fixed [AgentDojo release fixture](AGENTDOJO_EXAMPLE.md) is the minimum
@@ -143,6 +163,14 @@ refresh, corrupt-cache repair, automatic cache-affine Direct Push, and
 hash-verified result recovery. It requires no model provider and must run on a
 fresh remote host; its source-transfer metric records cache-fill work rather
 than public-internet bandwidth.
+
+Changes to Oracle dispatch, parent-ZIP transfer, trajectory handling, reward
+storage, or semantic recovery selectors must additionally pass the
+[Oracle remote gate](REMOTE_VALIDATION.md#oracle-trajectory-and-reward-release-gate).
+It verifies `pass`/`fail`/`error`/`inconclusive`, child-only retry, token-authenticated
+Hub/Runner calls, trace redaction, reward preservation, and SHA-256 recovery on
+a fresh remote host. The committed acceptance export is redacted; raw ZIPs,
+trace input, commands, and host identity remain outside Git.
 
 ## Non-Goals
 

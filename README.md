@@ -18,8 +18,9 @@ queryable result ZIPs.
 [Remote quick start](#remote-quick-start) |
 [Manifest](docs/TASK_MANIFEST.md) |
 [Architecture](docs/ARCHITECTURE.md) |
-[v0.3 release and protocol versions](docs/VERSIONING.md) |
+[v0.4 release and protocol versions](docs/VERSIONING.md) |
 [Source cache and affinity](docs/CACHE_AFFINITY.md) |
+[Oracle, trajectory, and reward](docs/ORACLE_TRAJECTORY_REWARD.md) |
 [Release contract](docs/RELEASE_CONTRACT.md) |
 [Support scope](docs/SCOPE.md)
 
@@ -64,7 +65,7 @@ recoverable evaluation throughput.
 - **Resource-aware shared-host admission.** A task can reserve CPU, memory,
   disk, and accelerators before it is leased, while `shared` and `exclusive`
   placement make host multiplexing explicit instead of accidental.
-- **Frozen Core Preview v0.3 contracts.** Versioned inventory, manifest, dispatch,
+- **Frozen Core Preview v0.4 contracts.** Versioned inventory, manifest, dispatch,
   token, CLI, and capability-query contracts keep downstream automation on a
   documented surface rather than internal Python helpers.
 - **Remote worker connections that persist.** Bootstrap workers once over SSH,
@@ -77,6 +78,11 @@ recoverable evaluation throughput.
 - **Recoverable evidence.** Each attempt keeps its task ID, attempt number,
   worker identity, logs, explicit artifacts, and result ZIP. A later successful
   retry does not erase the earlier failure package.
+- **Independent semantic evaluation.** An Oracle can consume a retained execution
+  ZIP on its own capable worker, report `pass`/`fail`/`error`/`inconclusive`, and
+  retry without rerunning the original Agent attempt. Opt-in trajectory exports
+  are redacted and size-bounded; Oracle-owned rewards stay structured and
+  queryable without turning Loom into an RL trainer.
 - **Integration-owned metadata.** Optional namespaced `extensions` flow from a
   campaign into recovered task and worker-result records without becoming a
   hidden scheduling or provider contract.
@@ -213,6 +219,8 @@ delivery protocol.
 | [Resource Admission](docs/RESOURCE_ADMISSION.md) | When sharing existing workers safely with declared task resource requests. |
 | [Source Cache And Cache Affinity](docs/CACHE_AFFINITY.md) | When reusing pinned Git sources or inspecting cache-local scheduling. |
 | [Source-Cache Gate Evidence](examples/source-cache/recovered/) | When inspecting the redacted remote cache-affinity release receipt. |
+| [Oracle, Trajectory, And Reward](docs/ORACLE_TRAJECTORY_REWARD.md) | When adding a semantic judge, redacted trace export, reward data, or selected result recovery. |
+| [Oracle Contract Example](examples/oracle/) | When adapting the smallest execution-to-Oracle flow to an operator-owned remote fleet. |
 | [Release Contract](docs/RELEASE_CONTRACT.md) | When changing phases, Direct Runner delivery, authentication, result retention, or release gates. |
 | [AgentDojo Release Fixture](docs/AGENTDOJO_EXAMPLE.md) | When running or inspecting the fixed 2-case x 2-run x 2-attempt remote regression. |
 | [Architecture](docs/ARCHITECTURE.md) | When integrating the Hub, Runner, connection modes, concurrency behavior, or result APIs. |
@@ -223,6 +231,8 @@ delivery protocol.
 ```text
 tools/loom_hub.py                # Loom Hub API, SQLite state, and CLI
 tools/loom_cache.py              # Immutable Git source descriptors
+tools/loom_evaluation.py         # Oracle, trajectory, and reward contracts
+tools/loom_export.py             # Selector-based SHA-256 result recovery
 tools/loom_runner.py             # Loom Runner
 tools/loom_manifest.py           # Loom Manifest normalizer
 tools/loom_matrix.py             # Loom Matrix remote runner

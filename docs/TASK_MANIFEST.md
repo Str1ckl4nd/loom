@@ -174,6 +174,21 @@ result ZIP preserves it in `task.json` and mirrors it in
 `worker-result.json` as `task_extensions`, so an exporter can consume it
 without reinterpreting an arbitrary manifest.
 
+## Oracle And Trajectory Contracts
+
+An execution task may optionally declare `oracle` and `trajectory_export` at
+campaign, `defaults`, case/run, `defaults.payload`, or `case.payload` level.
+They are public versioned contracts, not extension metadata. The selected object
+is atomic: later layers replace the full earlier object rather than merging
+nested fields. This keeps an Oracle's execution code, resource profile, retry
+policy, and semantic version internally consistent.
+
+`oracle` queues one separately leased child after a retained execution result;
+`trajectory_export` asks the Runner to redact a structured trace before it
+builds the attempt ZIP. Both contracts are opt-in and require
+`schema_version: 1`. See [Oracle, Trajectory, And Reward](ORACLE_TRAJECTORY_REWARD.md)
+for the exact schema, runtime variables, result format, and export selectors.
+
 ## Parameters And Runtime Injection
 
 The normalizer expands `{campaign_id}`, `{case_id}`, `{setting_id}`, `{run_id}`
@@ -196,6 +211,7 @@ LOOM_RUN_ID
 LOOM_SETTING_ID
 LOOM_PHASE_NAME
 LOOM_PHASE_INDEX
+LOOM_TASK_KIND
 ```
 
 Use `args` for phase-specific main-script parameters and `env` for compatible

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "fixture": "loom-oracle-trajectory-reward-release",
+  "contract": {
+    "semantic_flow": {
+      "execution_attempts": 1,
+      "oracle_tasks": 3,
+      "oracle_attempts": 4,
+      "retained_result_packages": 5,
+      "semantic_outcomes": [
+        "pass",
+        "fail",
+        "error",
+        "inconclusive"
+      ]
+    },
+    "repo_raw_trajectory_exclusion_flow": {
+      "execution_attempts": 1
+    }
+  },
+  "unit_tests": {
+    "oracle_contract": "passed",
+    "full_suite": "passed"
+  },
+  "checks": {
+    "oracle_uses_hash_verified_execution_input": true,
+    "oracle_retry_does_not_rerun_execution": true,
+    "execution_state_is_separate_from_oracle_outcome": true,
+    "execution_result_trigger_can_follow_a_failed_process": true,
+    "trajectory_is_redacted_and_raw_input_is_excluded": true,
+    "reward_components_and_metadata_are_preserved": true,
+    "all_attempts_and_semantic_export_selectors_are_hash_verified": true,
+    "hub_and_direct_runner_bearer_tokens_are_exercised": true
+  },
+  "redaction": {
+    "omitted": [
+      "hostnames",
+      "worker identifiers",
+      "result IDs and URLs",
+      "runtime paths",
+      "commands and logs",
+      "raw trajectory data",
+      "credentials"
+    ]
+  }
+}

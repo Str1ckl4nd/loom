@@ -1,6 +1,6 @@
 # Source Cache And Cache Affinity
 
-Loom v0.3 can reuse an immutable Git source on the same Runner without making
+Loom v0.4 can reuse an immutable Git source on the same Runner without making
 Hub a source-artifact store. The cache is local to a Runner; Hub sees only a
 credential-free cache key in the Runner health record.
 

@@ -173,6 +173,33 @@ Result packages may also include command logs and explicit artifacts. The fixed
 [AgentDojo release fixture](AGENTDOJO_EXAMPLE.md) validates recovery of eight
 packages across two cases, two runs, and two attempts.
 
+### Oracle, Trajectory, And Reward Plane
+
+An execution attempt can optionally request a v1 Oracle. After Hub persists the
+execution ZIP, it creates a separate child task that references that exact ZIP
+by result ID, byte length, SHA-256, and parent attempt number. The assigned
+Runner downloads and verifies the input before running the Oracle. The child has
+its own capability, resource admission, lease, state, result package, and retry
+history.
+
+```text
+execution task -> result ZIP -> Oracle child lease -> verified download -> Oracle ZIP + semantic outcome
+```
+
+The normal Hub task state remains a process fact. `pass`, `fail`, `error`, and
+`inconclusive` live in a separate Oracle outcome record, so an Oracle retry never
+releases or reruns a successful expensive execution attempt. Selector-based
+recovery includes both sides of a semantic decision and verifies the ZIP hashes
+on download.
+
+Trajectory capture is absent by default. An opt-in execution payload supplies a
+relative raw path, a distinct sanitized export path, a byte limit, and redaction
+patterns. Runner injects the raw path into the process, redacts the structured
+document, removes the raw source before artifact collection, and writes a
+trajectory receipt. Reward data is owned by the Oracle output and remains an
+exported semantic field, not a scheduler input. See [Oracle, Trajectory, And
+Reward](ORACLE_TRAJECTORY_REWARD.md).
+
 ## Infrastructure Boundary
 
 Loom starts after hosts exist. Cloud creation, rescaling, cost selection,

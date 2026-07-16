@@ -38,6 +38,15 @@ from loom_contract import (
     metadata,
     RUNNER_API_VERSION,
 )
+from loom_evaluation import (
+    ORACLE_OUTCOMES,
+    ORACLE_SCHEMA_VERSION,
+    normalize_oracle_result,
+    normalize_oracle_spec,
+    normalize_trajectory_export,
+    oracle_error_outcome,
+    oracle_task_id,
+)
 from loom_http import DEFAULT_HUB_TOKEN_ENV, DEFAULT_RUNNER_TOKEN_ENV, is_loopback_host, request_json as http_request_json, token_from_env, token_matches
 from loom_resources import (
     add_resources,
@@ -52,6 +61,8 @@ from loom_resources import (
 CASE_ROW = re.compile(r"^\|\s*(C\d+)\s*\|\s*`?([^`|]+)`?\s*\|\s*`?([^`|]+)`?\s*\|\s*`?([^`|]+)`?\s*\|")
 FINAL_STATES = {"clean", "dirty", "run_error", "needs_review", "accepted", "ignored", "blocked", "cancelled"}
 ERROR_STATES = {"run_error", "needs_review"}
+TASK_KINDS = {"execution", "oracle"}
+RECOVERY_SELECTORS = {"all_attempts", "execution_clean", "oracle_decided", "oracle_pass"}
 QUERY_FIELDS = {
     "task_id",
     "worker_id",
@@ -61,6 +72,10 @@ QUERY_FIELDS = {
     "case_version",
     "scenario_id",
     "package_id",
+    "task_kind",
+    "execution_task_id",
+    "execution_result_id",
+    "oracle_name",
     "state",
     "lease_worker_id",
     "attempt_no",
@@ -342,6 +357,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS tasks (
           task_id TEXT PRIMARY KEY,
+          task_kind TEXT NOT NULL DEFAULT 'execution',
           state TEXT NOT NULL,
           priority INTEGER NOT NULL DEFAULT 0,
           case_id TEXT,
@@ -358,6 +374,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           attempt_no INTEGER NOT NULL DEFAULT 1,
           result_id TEXT,
           error_json TEXT,
+          execution_task_id TEXT,
+          execution_result_id TEXT,
+          execution_attempt_no INTEGER,
+          oracle_name TEXT,
           excluded_worker_ids_json TEXT NOT NULL DEFAULT '[]',
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
@@ -421,6 +441,23 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           summary_json TEXT NOT NULL DEFAULT '{}'
         );
 
+        CREATE TABLE IF NOT EXISTS oracle_outcomes (
+          oracle_task_id TEXT NOT NULL,
+          attempt_no INTEGER NOT NULL,
+          result_id TEXT NOT NULL,
+          execution_task_id TEXT NOT NULL,
+          execution_result_id TEXT NOT NULL,
+          execution_attempt_no INTEGER NOT NULL,
+          outcome TEXT NOT NULL,
+          oracle_version TEXT NOT NULL,
+          reward_json TEXT NOT NULL DEFAULT '{}',
+          score_metadata_json TEXT NOT NULL DEFAULT '{}',
+          evidence_json TEXT NOT NULL DEFAULT '[]',
+          summary_json TEXT NOT NULL DEFAULT '{}',
+          recorded_at TEXT NOT NULL,
+          PRIMARY KEY (oracle_task_id, attempt_no)
+        );
+
         CREATE TABLE IF NOT EXISTS admin_overrides (
           override_seq INTEGER PRIMARY KEY AUTOINCREMENT,
           override_id TEXT NOT NULL,
@@ -457,10 +494,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "worker_hosts", "resource_capacity_json", "TEXT NOT NULL DEFAULT '{}'")
     ensure_column(conn, "tasks", "run_id", "TEXT")
     ensure_column(conn, "tasks", "setting_id", "TEXT")
+    ensure_column(conn, "tasks", "task_kind", "TEXT NOT NULL DEFAULT 'execution'")
+    ensure_column(conn, "tasks", "execution_task_id", "TEXT")
+    ensure_column(conn, "tasks", "execution_result_id", "TEXT")
+    ensure_column(conn, "tasks", "execution_attempt_no", "INTEGER")
+    ensure_column(conn, "tasks", "oracle_name", "TEXT")
     ensure_column(conn, "tasks", "excluded_worker_ids_json", "TEXT NOT NULL DEFAULT '[]'")
     ensure_column(conn, "result_packages", "attempt_no", "INTEGER NOT NULL DEFAULT 1")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_state_created ON tasks(state, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_case_run ON tasks(case_id, setting_id, run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_kind_state ON tasks(task_kind, state, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_oracle_outcomes_execution ON oracle_outcomes(execution_result_id, outcome)")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -608,6 +652,353 @@ def json_object(value: Any) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def task_kind(task: sqlite3.Row | dict[str, Any]) -> str:
+    try:
+        raw = task["task_kind"]
+    except (KeyError, IndexError):
+        raw = task.get("task_kind") if isinstance(task, dict) else None
+    value = str(raw or "execution")
+    return value if value in TASK_KINDS else "execution"
+
+
+def result_reference(conn: sqlite3.Connection, result_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT r.result_id,r.task_id,r.worker_id,r.attempt_no,r.bytes,r.sha256,r.verdict,r.uploaded_at,
+               t.task_kind,t.case_id,t.run_id,t.setting_id
+        FROM result_packages r
+        JOIN tasks t ON t.task_id=r.task_id
+        WHERE r.result_id=?
+        """,
+        (result_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "result_id": row["result_id"],
+        "task_id": row["task_id"],
+        "task_kind": task_kind(row),
+        "worker_id": row["worker_id"],
+        "attempt_no": int(row["attempt_no"] or 1),
+        "bytes": int(row["bytes"] or 0),
+        "sha256": row["sha256"],
+        "verdict": row["verdict"],
+        "uploaded_at": row["uploaded_at"],
+        "case_id": row["case_id"],
+        "run_id": row["run_id"],
+        "setting_id": row["setting_id"],
+    }
+
+
+def oracle_execution_reference(conn: sqlite3.Connection, task: sqlite3.Row | dict[str, Any]) -> dict[str, Any] | None:
+    if task_kind(task) != "oracle":
+        return None
+    try:
+        result_id = task["execution_result_id"]
+        execution_task_id = task["execution_task_id"]
+        execution_attempt_no = task["execution_attempt_no"]
+    except (KeyError, IndexError):
+        result_id = task.get("execution_result_id") if isinstance(task, dict) else None
+        execution_task_id = task.get("execution_task_id") if isinstance(task, dict) else None
+        execution_attempt_no = task.get("execution_attempt_no") if isinstance(task, dict) else None
+    if not result_id:
+        return None
+    reference = result_reference(conn, str(result_id))
+    if reference is None:
+        return {
+            "result_id": str(result_id),
+            "task_id": execution_task_id,
+            "attempt_no": safe_int(execution_attempt_no, 1),
+            "available": False,
+        }
+    return {**reference, "available": True}
+
+
+def oracle_outcome_public(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    def decoded(name: str, fallback: Any) -> Any:
+        try:
+            raw = row[name]
+        except (KeyError, IndexError):
+            raw = row.get(name) if isinstance(row, dict) else None
+        try:
+            return json.loads(raw or json.dumps(fallback))
+        except (TypeError, json.JSONDecodeError):
+            return fallback
+
+    return {
+        "oracle_task_id": row["oracle_task_id"],
+        "attempt_no": int(row["attempt_no"] or 1),
+        "result_id": row["result_id"],
+        "execution_task_id": row["execution_task_id"],
+        "execution_result_id": row["execution_result_id"],
+        "execution_attempt_no": int(row["execution_attempt_no"] or 1),
+        "outcome": row["outcome"],
+        "oracle_version": row["oracle_version"],
+        "reward": decoded("reward_json", {}),
+        "score_metadata": decoded("score_metadata_json", {}),
+        "evidence": decoded("evidence_json", []),
+        "summary": decoded("summary_json", {}),
+        "recorded_at": row["recorded_at"],
+    }
+
+
+def task_public_row(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    result = row_dict(row) or {}
+    result["task_kind"] = task_kind(row)
+    if result["task_kind"] == "oracle":
+        result["execution_result"] = oracle_execution_reference(conn, row)
+        latest = conn.execute(
+            "SELECT * FROM oracle_outcomes WHERE oracle_task_id=? ORDER BY attempt_no DESC LIMIT 1",
+            (row["task_id"],),
+        ).fetchone()
+        result["oracle_outcome"] = oracle_outcome_public(latest)
+    return result
+
+
+def result_public_row(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    result = row_dict(row) or {}
+    task = conn.execute("SELECT task_kind FROM tasks WHERE task_id=?", (row["task_id"],)).fetchone()
+    result["task_kind"] = task_kind(task) if task is not None else "execution"
+    if result["task_kind"] == "oracle":
+        outcome = conn.execute(
+            "SELECT * FROM oracle_outcomes WHERE oracle_task_id=? AND attempt_no=?",
+            (row["task_id"], int(row["attempt_no"] or 1)),
+        ).fetchone()
+        result["oracle_outcome"] = oracle_outcome_public(outcome)
+    return result
+
+
+def oracle_outcome_from_zip(
+    path: Path,
+    *,
+    result_path: str,
+    expected_oracle_version: str | None,
+) -> dict[str, Any]:
+    """Parse semantic Oracle output without changing the process execution verdict."""
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            names = archive.namelist()
+            matches = [name for name in names if name == result_path]
+            if not matches:
+                return oracle_error_outcome(f"missing required Oracle output: {result_path}", oracle_version=expected_oracle_version)
+            raw = json.loads(archive.read(matches[0]).decode("utf-8-sig"))
+        outcome = normalize_oracle_result(raw)
+        if expected_oracle_version and outcome["oracle_version"] != expected_oracle_version:
+            return oracle_error_outcome(
+                f"oracle_version mismatch: expected {expected_oracle_version}, received {outcome['oracle_version']}",
+                oracle_version=expected_oracle_version,
+            )
+        return outcome
+    except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        return oracle_error_outcome(f"{type(exc).__name__}: {exc}", oracle_version=expected_oracle_version)
+
+
+def queue_oracle_from_execution_result(
+    conn: sqlite3.Connection,
+    *,
+    execution_task: sqlite3.Row,
+    execution_result: dict[str, Any],
+    oracle_spec: dict[str, Any],
+    operator: str,
+    respect_when: bool,
+) -> dict[str, Any]:
+    """Create one independently retryable Oracle child for one retained ZIP."""
+    if task_kind(execution_task) != "execution":
+        raise ValueError("Oracle input must reference an execution result")
+    if execution_result.get("task_id") != execution_task["task_id"]:
+        raise ValueError("execution result does not belong to the requested execution task")
+    if respect_when and oracle_spec["when"] == "execution_clean" and execution_result.get("verdict") != "clean":
+        return {
+            "queued": False,
+            "reason": "execution_not_clean",
+            "execution_result_id": execution_result["result_id"],
+        }
+    payload = json_object(execution_task["payload_json"])
+    child_payload = json.loads(json.dumps(oracle_spec["payload"], ensure_ascii=False))
+    normalized = payload.get("normalized")
+    if isinstance(normalized, dict):
+        child_payload.setdefault("normalized", normalized)
+    if "execution_profile" in oracle_spec:
+        child_payload["execution_profile"] = normalize_execution_profile(oracle_spec["execution_profile"])
+    elif child_payload.get("execution_profile") is not None:
+        child_payload["execution_profile"] = normalize_execution_profile(child_payload["execution_profile"])
+    else:
+        child_payload["execution_profile"] = normalize_execution_profile(None)
+    if "retry_policy" in oracle_spec:
+        child_payload["retry_policy"] = oracle_spec["retry_policy"]
+    child_payload["oracle_contract"] = {
+        "schema_version": ORACLE_SCHEMA_VERSION,
+        "name": oracle_spec["name"],
+        "oracle_version": oracle_spec["oracle_version"],
+        "result_path": oracle_spec["result_path"],
+    }
+    attach_task_source_descriptor(child_payload)
+    execution_attempt_no = max(1, safe_int(execution_result.get("attempt_no"), 1))
+    child_task_id = oracle_task_id(str(execution_task["task_id"]), execution_attempt_no, str(oracle_spec["name"]))
+    package_id = f"{execution_task['package_id'] or execution_task['task_id']}-oracle-{oracle_spec['name']}"
+    existing = conn.execute("SELECT * FROM tasks WHERE task_id=?", (child_task_id,)).fetchone()
+    if existing is not None:
+        expected_config = {
+            "priority": int(oracle_spec["priority"]),
+            "case_id": execution_task["case_id"],
+            "run_id": execution_task["run_id"],
+            "setting_id": execution_task["setting_id"],
+            "case_version": execution_task["case_version"],
+            "scenario_id": execution_task["scenario_id"],
+            "package_id": package_id,
+            "payload": child_payload,
+            "components": json_object(execution_task["components_json"]),
+            "required_capability": oracle_spec["required_capability"],
+            "oracle_name": oracle_spec["name"],
+        }
+        existing_config = {
+            "priority": int(existing["priority"] or 0),
+            "case_id": existing["case_id"],
+            "run_id": existing["run_id"],
+            "setting_id": existing["setting_id"],
+            "case_version": existing["case_version"],
+            "scenario_id": existing["scenario_id"],
+            "package_id": existing["package_id"],
+            "payload": json_object(existing["payload_json"]),
+            "components": json_object(existing["components_json"]),
+            "required_capability": existing["required_capability"],
+            "oracle_name": existing["oracle_name"],
+        }
+        if (
+            task_kind(existing) != "oracle"
+            or existing["execution_result_id"] != execution_result["result_id"]
+            or existing["execution_task_id"] != execution_task["task_id"]
+            or existing_config != expected_config
+        ):
+            raise ValueError(f"oracle_task_id_conflict:{child_task_id}")
+        return {
+            "queued": False,
+            "reason": "already_exists",
+            "task_id": child_task_id,
+            "execution_result_id": execution_result["result_id"],
+            "state": existing["state"],
+        }
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO tasks(
+          task_id,task_kind,state,priority,case_id,run_id,setting_id,case_version,scenario_id,package_id,
+          payload_json,components_json,required_capability,execution_task_id,execution_result_id,
+          execution_attempt_no,oracle_name,created_at,updated_at
+        ) VALUES (?, 'oracle', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            child_task_id,
+            int(oracle_spec["priority"]),
+            execution_task["case_id"],
+            execution_task["run_id"],
+            execution_task["setting_id"],
+            execution_task["case_version"],
+            execution_task["scenario_id"],
+            package_id,
+            json.dumps(child_payload, ensure_ascii=False),
+            execution_task["components_json"],
+            oracle_spec["required_capability"],
+            execution_task["task_id"],
+            execution_result["result_id"],
+            execution_attempt_no,
+            oracle_spec["name"],
+            now,
+            now,
+        ),
+    )
+    log_task_event(
+        conn,
+        child_task_id,
+        "oracle_queued",
+        "controller",
+        operator,
+        None,
+        "queued",
+        {
+            "execution_task_id": execution_task["task_id"],
+            "execution_result_id": execution_result["result_id"],
+            "execution_attempt_no": execution_attempt_no,
+            "oracle_name": oracle_spec["name"],
+            "oracle_version": oracle_spec["oracle_version"],
+        },
+    )
+    return {
+        "queued": True,
+        "task_id": child_task_id,
+        "execution_result_id": execution_result["result_id"],
+        "execution_attempt_no": execution_attempt_no,
+        "state": "queued",
+    }
+
+
+def recovery_selector_rows(conn: sqlite3.Connection, selector: str) -> list[dict[str, Any]]:
+    """Return retained ZIP rows selected for recovery without deleting evidence."""
+    if selector not in RECOVERY_SELECTORS:
+        raise ValueError(f"unsupported recovery selector: {selector}")
+    selected: dict[str, dict[str, Any]] = {}
+
+    def add(result_id: str, *, role: str, reason: str, outcome: str | None = None) -> None:
+        row = conn.execute("SELECT * FROM result_packages WHERE result_id=?", (result_id,)).fetchone()
+        if row is None:
+            return
+        public = result_public_row(conn, row)
+        selection = {
+            "role": role,
+            "reason": reason,
+        }
+        if outcome is not None:
+            selection["oracle_outcome"] = outcome
+        prior = selected.get(result_id)
+        if prior is None:
+            public["selection"] = [selection]
+            selected[result_id] = public
+        elif selection not in prior["selection"]:
+            prior["selection"].append(selection)
+
+    if selector == "all_attempts":
+        for row in conn.execute("SELECT result_id FROM result_packages ORDER BY cursor"):
+            add(str(row["result_id"]), role="attempt", reason="all_attempts")
+    elif selector == "execution_clean":
+        for row in conn.execute(
+            """
+            SELECT r.result_id FROM result_packages r
+            JOIN tasks t ON t.task_id=r.task_id
+            WHERE t.task_kind='execution' AND r.verdict='clean'
+            ORDER BY r.cursor
+            """
+        ):
+            add(str(row["result_id"]), role="execution", reason="execution_clean")
+    else:
+        outcomes = {"pass"} if selector == "oracle_pass" else {"pass", "fail"}
+        placeholders = ",".join("?" for _ in outcomes)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM oracle_outcomes
+            WHERE outcome IN ({placeholders})
+            ORDER BY recorded_at, oracle_task_id, attempt_no
+            """,
+            sorted(outcomes),
+        ).fetchall()
+        for outcome_row in rows:
+            outcome = str(outcome_row["outcome"])
+            add(
+                str(outcome_row["execution_result_id"]),
+                role="execution",
+                reason=selector,
+                outcome=outcome,
+            )
+            add(
+                str(outcome_row["result_id"]),
+                role="oracle",
+                reason=selector,
+                outcome=outcome,
+            )
+    return sorted(selected.values(), key=lambda item: (str(item.get("uploaded_at") or ""), str(item.get("result_id") or "")))
 
 
 def merged_dispatch_extensions(dispatch: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | None:
@@ -1184,6 +1575,7 @@ def score_result_zip(path: Path) -> tuple[str, dict[str, Any]]:
             artifact_summary_names = [n for n in names if n.endswith("artifact-summary.json")]
             artifact_manifest_names = [n for n in names if n.endswith("artifact-manifest.json")]
             phase_result_names = [n for n in names if n.endswith("phase-results.json")]
+            trajectory_summary_names = [n for n in names if n.endswith("trajectory-summary.json")]
             scheduler_names = [n for n in names if n.endswith("case-scheduler-summary.json")]
             score_names = [n for n in names if n.endswith("score-summary.json")]
             scored = False
@@ -1201,6 +1593,8 @@ def score_result_zip(path: Path) -> tuple[str, dict[str, Any]]:
                 summary["artifact_manifest"] = json.loads(z.read(sorted(artifact_manifest_names)[0]).decode("utf-8-sig"))
             if phase_result_names:
                 summary["phase_results"] = json.loads(z.read(sorted(phase_result_names)[0]).decode("utf-8-sig"))
+            if trajectory_summary_names:
+                summary["trajectory"] = json.loads(z.read(sorted(trajectory_summary_names)[0]).decode("utf-8-sig"))
             if not scored and scheduler_names:
                 data = json.loads(z.read(sorted(scheduler_names)[0]).decode("utf-8-sig"))
                 summary["case_scheduler_summary"] = data
@@ -1366,6 +1760,10 @@ class Handler(BaseHTTPRequestHandler):
                     "lease_worker_id",
                     "attempt_no",
                     "result_id",
+                    "task_kind",
+                    "execution_task_id",
+                    "execution_result_id",
+                    "oracle_name",
                 ):
                     values = split_csv(qs.get(field, [""])[0])
                     if values:
@@ -1375,7 +1773,7 @@ class Handler(BaseHTTPRequestHandler):
                 with self._db() as conn:
                     total = int(conn.execute(f"SELECT COUNT(*) FROM tasks {where}", params).fetchone()[0])
                     rows = [
-                        row_dict(r)
+                        task_public_row(conn, r)
                         for r in conn.execute(
                             f"SELECT * FROM tasks {where} ORDER BY priority DESC, created_at LIMIT ? OFFSET ?",
                             [*params, limit, offset],
@@ -1490,7 +1888,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/data/running-tasks":
                 with self._db() as conn:
                     rows = [
-                        row_dict(r)
+                        task_public_row(conn, r)
                         for r in conn.execute(
                             """
                             SELECT * FROM tasks
@@ -1516,7 +1914,7 @@ class Handler(BaseHTTPRequestHandler):
                 params.append(limit)
                 with self._db() as conn:
                     rows = [
-                        row_dict(r)
+                        result_public_row(conn, r)
                         for r in conn.execute(
                             f"SELECT * FROM result_packages WHERE {' AND '.join(clauses)} ORDER BY cursor LIMIT ?",
                             params,
@@ -1524,6 +1922,63 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                     next_cursor = rows[-1]["cursor"] if rows else cursor
                 self._json(200, {"cursor": cursor, "next_cursor": next_cursor, "filters": filters, "results": rows})
+                return
+            if path == "/api/data/oracle-outcomes":
+                limit = max(1, min(int(qs.get("limit", ["100"])[0]), 500))
+                offset = max(0, int(qs.get("offset", ["0"])[0]))
+                clauses: list[str] = []
+                params: list[Any] = []
+                for field in ("oracle_task_id", "execution_task_id", "execution_result_id", "outcome", "oracle_version"):
+                    values = split_csv(qs.get(field, [""])[0])
+                    if field == "outcome" and any(value not in ORACLE_OUTCOMES for value in values):
+                        self._json(400, {"error": "unsupported_oracle_outcome", "allowed": sorted(ORACLE_OUTCOMES)})
+                        return
+                    if values:
+                        clauses.append(f"{field} IN ({','.join('?' for _ in values)})")
+                        params.extend(values)
+                where = "WHERE " + " AND ".join(clauses) if clauses else ""
+                with self._db() as conn:
+                    total = int(conn.execute(f"SELECT COUNT(*) FROM oracle_outcomes {where}", params).fetchone()[0])
+                    rows = [
+                        oracle_outcome_public(row)
+                        for row in conn.execute(
+                            f"SELECT * FROM oracle_outcomes {where} ORDER BY recorded_at,oracle_task_id,attempt_no LIMIT ? OFFSET ?",
+                            [*params, limit, offset],
+                        )
+                    ]
+                next_offset = offset + len(rows)
+                self._json(
+                    200,
+                    {
+                        "outcomes": rows,
+                        "total": total,
+                        "offset": offset,
+                        "next_offset": next_offset if next_offset < total else None,
+                    },
+                )
+                return
+            if path == "/api/data/export":
+                selector = str(qs.get("selector", ["all_attempts"])[0] or "all_attempts")
+                if selector not in RECOVERY_SELECTORS:
+                    self._json(400, {"error": "unsupported_recovery_selector", "allowed": sorted(RECOVERY_SELECTORS)})
+                    return
+                limit = max(1, min(int(qs.get("limit", ["500"])[0]), 1000))
+                offset = max(0, int(qs.get("offset", ["0"])[0]))
+                with self._db() as conn:
+                    selected = recovery_selector_rows(conn, selector)
+                page = selected[offset : offset + limit]
+                next_offset = offset + len(page)
+                self._json(
+                    200,
+                    {
+                        "selector": selector,
+                        "retention": "raw_attempt_packages_are_never_deleted_by_export",
+                        "results": page,
+                        "total": len(selected),
+                        "offset": offset,
+                        "next_offset": next_offset if next_offset < len(selected) else None,
+                    },
+                )
                 return
             if path == "/api/data/error-rate":
                 group_by = qs.get("by", ["state"])[0]
@@ -1598,6 +2053,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/tasks/dispatch":
                 self._dispatch_tasks()
+                return
+            if path == "/api/oracles/dispatch":
+                self._dispatch_oracle()
                 return
             if path == "/api/workers/register":
                 self._register_worker()
@@ -1686,6 +2144,8 @@ class Handler(BaseHTTPRequestHandler):
             for index, spec in enumerate(task_specs, start=1):
                 if not isinstance(spec, dict):
                     raise ValueError(f"tasks[{index}] must be an object")
+                if str(spec.get("task_kind") or "execution") != "execution":
+                    raise ValueError("execution tasks must use /api/tasks/dispatch; Oracle children use /api/oracles/dispatch")
                 merged_dispatch_extensions(payload, spec)
                 dispatch_payload = payload.get("payload") or {}
                 spec_payload = spec.get("payload") or {}
@@ -1693,9 +2153,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(f"tasks[{index}].payload must be an object")
                 source_payload = dict(dispatch_payload)
                 source_payload.update(spec_payload)
+                if source_payload.get("oracle") is not None:
+                    source_payload["oracle"] = normalize_oracle_spec(source_payload["oracle"])
+                if source_payload.get("trajectory_export") is not None:
+                    source_payload["trajectory_export"] = normalize_trajectory_export(source_payload["trajectory_export"])
                 attach_task_source_descriptor(source_payload)
         except ValueError as exc:
-            error = "invalid_source_descriptor" if "source_descriptor" in str(exc) or "git source" in str(exc) else "invalid_task_extensions"
+            detail = str(exc)
+            if "source_descriptor" in detail or "git source" in detail:
+                error = "invalid_source_descriptor"
+            elif "oracle" in detail.lower() or "trajectory" in detail.lower():
+                error = "invalid_evaluation_contract"
+            else:
+                error = "invalid_task_extensions"
             self._json(400, {"error": error, "detail": str(exc)})
             return
         created: list[dict[str, Any]] = []
@@ -1711,6 +2181,10 @@ class Handler(BaseHTTPRequestHandler):
                 spec_payload = spec.get("payload") or {}
                 task_payload = dict(dispatch_payload)
                 task_payload.update(spec_payload)
+                if task_payload.get("oracle") is not None:
+                    task_payload["oracle"] = normalize_oracle_spec(task_payload["oracle"])
+                if task_payload.get("trajectory_export") is not None:
+                    task_payload["trajectory_export"] = normalize_trajectory_export(task_payload["trajectory_export"])
                 extensions = merged_dispatch_extensions(payload, spec)
                 if extensions is not None:
                     task_payload["extensions"] = extensions
@@ -1727,6 +2201,7 @@ class Handler(BaseHTTPRequestHandler):
                 scenario_id = spec.get("scenario_id") or case.get("scenario_id")
                 required_capability = spec.get("required_capability") or payload.get("required_capability")
                 task_config = {
+                    "task_kind": "execution",
                     "priority": priority,
                     "case_id": case_id,
                     "run_id": run_id,
@@ -1741,6 +2216,7 @@ class Handler(BaseHTTPRequestHandler):
                 row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
                 if row is not None:
                     existing_config = {
+                        "task_kind": task_kind(row),
                         "priority": int(row["priority"] or 0),
                         "case_id": row["case_id"],
                         "run_id": row["run_id"],
@@ -1767,9 +2243,9 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute(
                     """
                     INSERT INTO tasks(
-                      task_id, state, priority, case_id, run_id, setting_id, case_version, scenario_id, package_id,
+                      task_id, task_kind, state, priority, case_id, run_id, setting_id, case_version, scenario_id, package_id,
                       payload_json, components_json, required_capability, created_at, updated_at
-                    ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, 'execution', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -1788,9 +2264,87 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 log_task_event(conn, task_id, "task_dispatched", "user", str(payload.get("operator") or "local"), None, "queued", spec)
-                created.append({"task_id": task_id, "case_id": case_id, "run_id": run_id, "setting_id": setting_id, "state": "queued"})
+                created.append({"task_id": task_id, "task_kind": "execution", "case_id": case_id, "run_id": run_id, "setting_id": setting_id, "state": "queued"})
             conn.commit()
         self._json(201 if created else 200, {"created": created, "existing": existing})
+
+    def _dispatch_oracle(self) -> None:
+        payload = self._read_json()
+        try:
+            schema_version = int(payload.get("schema_version"))
+        except (TypeError, ValueError):
+            self._json(400, {"error": "dispatch_requires_schema_version", "expected": DISPATCH_SCHEMA_VERSION})
+            return
+        if schema_version != DISPATCH_SCHEMA_VERSION:
+            self._json(
+                400,
+                {
+                    "error": "unsupported_dispatch_schema_version",
+                    "expected": DISPATCH_SCHEMA_VERSION,
+                    "received": schema_version,
+                },
+            )
+            return
+        execution_result_id = str(payload.get("execution_result_id") or "").strip()
+        if not execution_result_id:
+            self._json(400, {"error": "execution_result_id_required"})
+            return
+        try:
+            oracle_spec = normalize_oracle_spec(payload.get("oracle"), field="oracle")
+        except ValueError as exc:
+            self._json(400, {"error": "invalid_oracle_contract", "detail": str(exc)})
+            return
+        operator = str(payload.get("operator") or "local-operator")
+        with self._db() as conn:
+            execution_result = result_reference(conn, execution_result_id)
+            if execution_result is None:
+                self._json(404, {"error": "execution_result_not_found", "execution_result_id": execution_result_id})
+                return
+            if execution_result["task_kind"] != "execution":
+                self._json(400, {"error": "execution_result_required", "execution_result_id": execution_result_id})
+                return
+            execution_task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (execution_result["task_id"],)).fetchone()
+            if execution_task is None:
+                self._json(404, {"error": "execution_task_not_found", "task_id": execution_result["task_id"]})
+                return
+            try:
+                queued = queue_oracle_from_execution_result(
+                    conn,
+                    execution_task=execution_task,
+                    execution_result=execution_result,
+                    oracle_spec=oracle_spec,
+                    operator=operator,
+                    respect_when=False,
+                )
+            except ValueError as exc:
+                if str(exc).startswith("oracle_task_id_conflict:"):
+                    self._json(
+                        409,
+                        {
+                            "error": "oracle_task_id_conflict",
+                            "execution_result_id": execution_result_id,
+                            "detail": str(exc),
+                        },
+                    )
+                    return
+                raise
+            log_control(
+                conn,
+                self.server,
+                "info",
+                "oracle_dispatch",
+                f"{operator} requested Oracle {oracle_spec['name']} for execution result {execution_result_id}",
+                task_id=queued.get("task_id"),
+                payload={
+                    "execution_result_id": execution_result_id,
+                    "oracle_name": oracle_spec["name"],
+                    "oracle_version": oracle_spec["oracle_version"],
+                    "required_capability": oracle_spec["required_capability"],
+                    "queued": queued,
+                },
+            )
+            conn.commit()
+        self._json(201 if queued.get("queued") else 200, {"ok": True, "oracle": queued})
 
     def _register_worker(self) -> None:
         payload = self._read_json()
@@ -2029,6 +2583,7 @@ class Handler(BaseHTTPRequestHandler):
                 claimed.append(
                     {
                         "task_id": task["task_id"],
+                        "task_kind": task_kind(task),
                         "lease_until": lease_until,
                         "case_id": task["case_id"],
                         "run_id": task["run_id"],
@@ -2051,6 +2606,8 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     }
                 )
+                if task_kind(task) == "oracle":
+                    claimed[-1]["execution_result"] = oracle_execution_reference(conn, task)
             if claimed:
                 claim_batch_id = "claim-" + str(uuid.uuid4())
                 claim_batch_size = len(claimed)
@@ -2167,9 +2724,11 @@ class Handler(BaseHTTPRequestHandler):
                     "cache_affinity": cache_affinity,
                 },
             )
+            execution_result = oracle_execution_reference(conn, task) if task_kind(task) == "oracle" else None
             conn.commit()
         return 200, {
             "task_id": task["task_id"],
+            "task_kind": task_kind(task),
             "lease_until": lease_until,
             "case_id": task["case_id"],
             "run_id": task["run_id"],
@@ -2192,6 +2751,11 @@ class Handler(BaseHTTPRequestHandler):
                 "cache_affinity": cache_affinity,
             },
             "controller_push": {"push_id": push_id, "leased_at": now},
+            **(
+                {"execution_result": execution_result}
+                if execution_result is not None
+                else {}
+            ),
         }
 
     def _direct_worker_endpoint_from_row(self, row: sqlite3.Row | None) -> tuple[str, str] | None:
@@ -2423,7 +2987,7 @@ class Handler(BaseHTTPRequestHandler):
         error_text = json.dumps(payload.get("error") or payload, ensure_ascii=False)
         issues = classify_issue_text(error_text) or ["run_error"]
         with self._db() as conn:
-            task = conn.execute("SELECT lease_worker_id,state FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             if task is None:
                 self._json(404, {"error": "task_not_found"})
                 return
@@ -2438,6 +3002,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if task_kind(task) == "oracle":
+                issues = sorted(set([*issues, "oracle_error"]))
             conn.execute("UPDATE tasks SET error_json=? WHERE task_id=?", (error_text, task_id))
             changed = set_task_state(conn, task_id, "run_error", "worker", worker_id, "task_failed", payload)
             worker = conn.execute("SELECT 1 FROM workers WHERE worker_id=?", (worker_id,)).fetchone()
@@ -2488,10 +3054,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(411, {"error": "content_length_required"})
             return
         with self._db() as conn:
-            task = conn.execute(
-                "SELECT lease_worker_id,state,attempt_no FROM tasks WHERE task_id=?",
-                (task_id,),
-            ).fetchone()
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if task is None:
             self._json(404, {"error": "task_not_found"})
             return
@@ -2515,7 +3078,18 @@ class Handler(BaseHTTPRequestHandler):
                     digest.update(chunk)
                     remaining -= len(chunk)
         verdict, summary = score_result_zip(final_path)
+        semantic_oracle_outcome: dict[str, Any] | None = None
+        if task_kind(task) == "oracle":
+            task_payload = json_object(task["payload_json"])
+            oracle_contract = task_payload.get("oracle_contract") if isinstance(task_payload.get("oracle_contract"), dict) else {}
+            semantic_oracle_outcome = oracle_outcome_from_zip(
+                final_path,
+                result_path=str(oracle_contract.get("result_path") or "oracle-result.json"),
+                expected_oracle_version=str(oracle_contract.get("oracle_version") or "") or None,
+            )
+            summary["oracle_outcome"] = semantic_oracle_outcome
         now = utc_now()
+        oracle_dispatch: dict[str, Any] | None = None
         with self._db() as conn:
             conn.execute(
                 """
@@ -2543,6 +3117,78 @@ class Handler(BaseHTTPRequestHandler):
             log_task_event(conn, task_id, "result_uploaded", "worker", worker_id, None, "uploaded", {"result_id": result_id, "bytes": length})
             set_task_state(conn, task_id, "imported", "controller", "result_importer", "result_imported", {"result_id": result_id})
             set_task_state(conn, task_id, verdict, "controller", "result_scorer", "result_scored", {"result_id": result_id, "verdict": verdict})
+            if task_kind(task) == "oracle" and semantic_oracle_outcome is not None:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO oracle_outcomes(
+                      oracle_task_id,attempt_no,result_id,execution_task_id,execution_result_id,execution_attempt_no,
+                      outcome,oracle_version,reward_json,score_metadata_json,evidence_json,summary_json,recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        attempt_no,
+                        result_id,
+                        str(task["execution_task_id"] or ""),
+                        str(task["execution_result_id"] or ""),
+                        max(1, safe_int(task["execution_attempt_no"], 1)),
+                        semantic_oracle_outcome["outcome"],
+                        semantic_oracle_outcome["oracle_version"],
+                        json.dumps(semantic_oracle_outcome.get("reward") or {}, ensure_ascii=False),
+                        json.dumps(semantic_oracle_outcome.get("score_metadata") or {}, ensure_ascii=False),
+                        json.dumps(semantic_oracle_outcome.get("evidence") or [], ensure_ascii=False),
+                        json.dumps(semantic_oracle_outcome.get("summary") or {}, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                log_task_event(
+                    conn,
+                    task_id,
+                    "oracle_outcome_recorded",
+                    "controller",
+                    "oracle_importer",
+                    verdict,
+                    verdict,
+                    {
+                        "result_id": result_id,
+                        "outcome": semantic_oracle_outcome["outcome"],
+                        "oracle_version": semantic_oracle_outcome["oracle_version"],
+                    },
+                )
+            elif task_kind(task) == "execution":
+                execution_payload = json_object(task["payload_json"])
+                raw_oracle = execution_payload.get("oracle")
+                if raw_oracle is not None:
+                    try:
+                        oracle_spec = normalize_oracle_spec(raw_oracle)
+                        execution_result = result_reference(conn, result_id)
+                        if execution_result is None:
+                            raise ValueError("stored execution result could not be referenced")
+                        oracle_dispatch = queue_oracle_from_execution_result(
+                            conn,
+                            execution_task=task,
+                            execution_result=execution_result,
+                            oracle_spec=oracle_spec,
+                            operator="result_importer",
+                            respect_when=True,
+                        )
+                    except ValueError as exc:
+                        oracle_dispatch = {"queued": False, "reason": "invalid_oracle_contract", "detail": str(exc)}
+                        log_control(
+                            conn,
+                            self.server,
+                            "warning",
+                            "oracle_dispatch_failed",
+                            f"execution result {result_id} could not queue its configured Oracle",
+                            task_id=task_id,
+                            payload=oracle_dispatch,
+                        )
+            if oracle_dispatch is not None:
+                summary["oracle_dispatch"] = oracle_dispatch
+                conn.execute(
+                    "UPDATE result_packages SET summary_json=? WHERE result_id=?",
+                    (json.dumps(summary, ensure_ascii=False), result_id),
+                )
             if worker_id:
                 update_worker_concurrency_from_result(conn, self.server, worker_id, task_id, verdict, summary)
             else:
@@ -2557,12 +3203,22 @@ class Handler(BaseHTTPRequestHandler):
                         task_id=task_id,
                         payload={"result_id": result_id, "verdict": verdict},
                     )
+            retry_issues = [str(value) for value in summary.get("issues") or []]
+            if semantic_oracle_outcome is not None and semantic_oracle_outcome.get("outcome") == "error":
+                retry_issues.append("oracle_error")
+            retry_issues = sorted(set(retry_issues))
+            if retry_issues:
+                summary["issues"] = retry_issues
+                conn.execute(
+                    "UPDATE result_packages SET summary_json=? WHERE result_id=?",
+                    (json.dumps(summary, ensure_ascii=False), result_id),
+                )
             auto_retry = queue_automatic_retry(
                 conn,
                 self.server,
                 task_id,
                 worker_id,
-                [str(value) for value in summary.get("issues") or []],
+                retry_issues,
             )
             conn.commit()
         self._json(
@@ -2574,6 +3230,8 @@ class Handler(BaseHTTPRequestHandler):
                 "verdict": verdict,
                 "path": str(final_path),
                 "auto_retry": auto_retry,
+                "oracle_outcome": semantic_oracle_outcome,
+                "oracle_dispatch": oracle_dispatch,
             },
         )
 
@@ -2955,6 +3613,24 @@ def cmd_dispatch_spec(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dispatch_oracle(args: argparse.Namespace) -> int:
+    oracle = read_json(args.oracle)
+    if not isinstance(oracle, dict):
+        raise ValueError("Oracle spec must be a JSON object")
+    out = request_json(
+        args.controller.rstrip("/") + "/api/oracles/dispatch",
+        {
+            "schema_version": DISPATCH_SCHEMA_VERSION,
+            "operator": args.operator,
+            "execution_result_id": args.execution_result_id,
+            "oracle": oracle,
+        },
+        token=controller_token(args),
+    )
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_capabilities(args: argparse.Namespace) -> int:
     out = request_json(args.controller.rstrip("/") + "/api/meta", token=controller_token(args))
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -2971,6 +3647,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
         "worker_cache": request_json(base + "/api/data/worker-cache", token=controller_token(args)),
         "tasks": request_json(base + "/api/tasks?limit=200", token=controller_token(args)),
         "results": request_json(base + f"/api/data/new-results?cursor={args.cursor}&limit=200", token=controller_token(args)),
+        "oracle_outcomes": request_json(base + "/api/data/oracle-outcomes?limit=200", token=controller_token(args)),
         "error_rate": request_json(base + "/api/data/error-rate?by=state&window_seconds=86400", token=controller_token(args)),
         "control_log": request_json(base + "/api/data/control-log?limit=100", token=controller_token(args)),
     }
@@ -3116,6 +3793,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("spec", type=Path, help="JSON dispatch payload, or '-' for stdin.")
     add_controller_auth_arg(p)
     p.set_defaults(func=cmd_dispatch_spec)
+
+    p = sub.add_parser("dispatch-oracle")
+    p.add_argument("--controller", default="http://127.0.0.1:8765")
+    p.add_argument("--execution-result-id", required=True)
+    p.add_argument("--operator", default="local-operator")
+    p.add_argument("oracle", type=Path, help="Versioned Oracle JSON object")
+    add_controller_auth_arg(p)
+    p.set_defaults(func=cmd_dispatch_oracle)
 
     p = sub.add_parser("summary")
     p.add_argument("--controller", default="http://127.0.0.1:8765")

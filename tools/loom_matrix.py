@@ -39,6 +39,16 @@ SSH_STARTED_MODES = {"ssh-start", "long-poll", "direct-worker-api"}
 HUB_TOKEN: str | None = None
 HUB_TOKEN_ENV = DEFAULT_HUB_TOKEN_ENV
 DEFAULT_DIRECT_RUNNER_TOKEN_ENV = DEFAULT_RUNNER_TOKEN_ENV
+REMOTE_TOOL_FILES = (
+    "loom_contract.py",
+    "loom_cache.py",
+    "loom_http.py",
+    "loom_resources.py",
+    "loom_evaluation.py",
+    "loom_hub.py",
+    "loom_runner.py",
+    "loom_manifest.py",
+)
 
 
 def run(cmd: list[str], *, timeout: int = 120, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -272,15 +282,7 @@ def load_inventory(path: Path) -> dict[str, Any]:
 
 def remote_setup(host: dict[str, Any], remote_dir: str, tool_root: Path) -> None:
     ssh(host, f"mkdir -p {shlex.quote(remote_dir)}")
-    for name in (
-        "loom_contract.py",
-        "loom_cache.py",
-        "loom_http.py",
-        "loom_resources.py",
-        "loom_hub.py",
-        "loom_runner.py",
-        "loom_manifest.py",
-    ):
+    for name in REMOTE_TOOL_FILES:
         scp(host, tool_root / name, f"{remote_dir}/{name}")
 
 
@@ -295,19 +297,24 @@ def source_requirements(dispatch_specs: list[Path]) -> dict[str, dict[str, Any]]
         payload = json.loads(dispatch_spec.read_text(encoding="utf-8-sig"))
         for task in payload.get("tasks") or []:
             task_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
-            source = task_payload.get("source") if isinstance(task_payload.get("source"), dict) else {}
-            url = str(source.get("url") or source.get("repo_url") or "")
-            parsed = urlsplit(url)
-            if not parsed.hostname:
-                continue
-            capability = source_capability(parsed.hostname)
-            default_port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else 22
-            requirements[capability] = {
-                "capability": capability,
-                "hostname": parsed.hostname,
-                "port": parsed.port or default_port,
-                "source_url": url,
-            }
+            source_payloads = [task_payload]
+            oracle = task_payload.get("oracle")
+            if isinstance(oracle, dict) and isinstance(oracle.get("payload"), dict):
+                source_payloads.append(oracle["payload"])
+            for source_payload in source_payloads:
+                source = source_payload.get("source") if isinstance(source_payload.get("source"), dict) else {}
+                url = str(source.get("url") or source.get("repo_url") or "")
+                parsed = urlsplit(url)
+                if not parsed.hostname:
+                    continue
+                capability = source_capability(parsed.hostname)
+                default_port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else 22
+                requirements[capability] = {
+                    "capability": capability,
+                    "hostname": parsed.hostname,
+                    "port": parsed.port or default_port,
+                    "source_url": url,
+                }
     return requirements
 
 
